@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::command::CommandResultPayload;
-use super::permission::{AttentionRequired, PermissionRequest, PermissionResolved};
+use super::permission::{PermissionRequest, PermissionResolved};
 use super::timeline::Timeline;
 use super::usage::{LogLine, ResumeHandle, Usage, UsageDelta};
 
@@ -49,7 +49,6 @@ pub enum Kind {
     Timeline,
     PermissionRequest,
     PermissionResolved,
-    AttentionRequired,
     Log,
     UsageDelta,
     CommandResult,
@@ -70,7 +69,6 @@ pub enum Payload {
     Timeline(Timeline),
     PermissionRequest(PermissionRequest),
     PermissionResolved(PermissionResolved),
-    AttentionRequired(AttentionRequired),
     Log(LogLine),
     UsageDelta(UsageDelta),
     CommandResult(CommandResultPayload),
@@ -88,7 +86,6 @@ impl Payload {
             Self::Timeline(_) => Kind::Timeline,
             Self::PermissionRequest(_) => Kind::PermissionRequest,
             Self::PermissionResolved(_) => Kind::PermissionResolved,
-            Self::AttentionRequired(_) => Kind::AttentionRequired,
             Self::Log(_) => Kind::Log,
             Self::UsageDelta(_) => Kind::UsageDelta,
             Self::CommandResult(_) => Kind::CommandResult,

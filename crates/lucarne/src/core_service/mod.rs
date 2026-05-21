@@ -6,7 +6,7 @@ pub struct CoreOptions {
     /// How long a submitted turn can be completely silent (no events)
     /// before the core watchdog fails it.
     pub turn_inactivity: Duration,
-    /// Absolute ceiling on turn duration from submission.
+    /// Maximum time a submitted turn may remain incomplete after last activity.
     pub turn_deadline: Duration,
     /// Default idle timeout for agent sessions (auto-close when idle).
     /// Overridable per-session via `idle_timeout_ms`.

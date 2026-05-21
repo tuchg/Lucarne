@@ -40,11 +40,6 @@ pub struct PermissionResolved {
     pub by: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AttentionRequired {
-    pub reason: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Decision {

@@ -953,7 +953,9 @@ impl BotState {
         let Some(workspace) = self.core.workspace_binding(&control_workspace_id(ws)) else {
             return Ok(None);
         };
-        let channel_bindings = self.core.channel_bindings_for_workspace(&workspace.workspace_id);
+        let channel_bindings = self
+            .core
+            .channel_bindings_for_workspace(&workspace.workspace_id);
         let telegram_binding = channel_bindings
             .iter()
             .find(|binding| binding.channel.as_str() == "telegram" && binding.topic_id.is_some())

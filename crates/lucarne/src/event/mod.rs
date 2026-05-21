@@ -24,8 +24,8 @@ pub use core::{
     TurnFailed, TurnStarted,
 };
 pub use permission::{
-    AttentionRequired, Decision, PermissionAnswer, PermissionQuestion, PermissionQuestionOption,
-    PermissionRequest, PermissionResolved, PermissionResponse, Risk,
+    Decision, PermissionAnswer, PermissionQuestion, PermissionQuestionOption, PermissionRequest,
+    PermissionResolved, PermissionResponse, Risk,
 };
 pub use timeline::{
     new_timeline_assistant, new_timeline_reasoning, new_timeline_tool_call,

@@ -1145,6 +1145,59 @@ async fn agent_runtime_session_auto_closes_after_idle_timeout() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn agent_runtime_session_idle_timeout_resets_after_stdio_event() {
+    let (session, tx) = runtime::synthetic_session();
+    tx.send(CanonicalEvent::new(Payload::SessionStarted(
+        SessionStarted {
+            session_id: "provider-session".into(),
+            model: "model".into(),
+        },
+    )))
+    .await
+    .expect("send session started");
+    let session = AgentSessionFacade::attach_with_options(
+        TEST_PROVIDER_ID,
+        InstanceId("instance-idle-stdio-activity".into()),
+        session,
+        None,
+        None,
+        AgentSessionOptions::with_idle_timeout(Some(Duration::from_millis(80))),
+    )
+    .await
+    .expect("attach");
+    let mut events = session.take_events().await.expect("take events");
+
+    tokio::task::yield_now().await;
+    advance(Duration::from_millis(50)).await;
+    tx.send(CanonicalEvent::new(Payload::Timeline(Timeline {
+        item: event::new_timeline_user("keepalive", "stdio keepalive"),
+    })))
+    .await
+    .expect("send keepalive event");
+
+    assert!(matches!(
+        timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("keepalive event should be delivered"),
+        Some(PublicEvent::Message(message)) if message.text.as_str() == "stdio keepalive"
+    ));
+    advance(Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        session.observed_close_reason().await.as_deref(),
+        None,
+        "stdio event should reset the idle timeout window"
+    );
+
+    advance(Duration::from_millis(31)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        session.observed_close_reason().await.as_deref(),
+        Some("idle timeout")
+    );
+}
+
 #[tokio::test]
 async fn agent_runtime_session_no_output_ack_command_returns_to_idle() {
     let session = start_echo_session().await;

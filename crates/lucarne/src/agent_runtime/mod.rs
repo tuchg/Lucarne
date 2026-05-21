@@ -9,6 +9,7 @@ pub mod session;
 pub mod types;
 
 pub type AgentEventStream = tokio::sync::mpsc::Receiver<events::Event>;
+pub type AgentActivityStream = tokio::sync::mpsc::Receiver<()>;
 pub type RuntimeBusStream = tokio::sync::mpsc::Receiver<types::RuntimeBusOutput>;
 
 pub use crate::ProviderId;

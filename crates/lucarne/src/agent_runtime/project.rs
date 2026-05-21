@@ -91,7 +91,7 @@ impl Projector {
                         code: failed.code.clone().into(),
                     }));
             }
-            Payload::TurnStarted(_) | Payload::AttentionRequired(_) => {}
+            Payload::TurnStarted(_) => {}
             Payload::PermissionResolved(_) | Payload::Log(_) => {}
         }
         projection

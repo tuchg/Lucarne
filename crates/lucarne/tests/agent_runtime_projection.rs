@@ -306,15 +306,12 @@ fn agent_runtime_projection_uses_capabilities_for_structured_interventions() {
 
 #[test]
 fn agent_runtime_projection_ignores_internal_lifecycle_and_log_rows() {
-    // TurnStarted, AttentionRequired and Log rows are internal-only;
+    // TurnStarted and Log rows are internal-only;
     // TurnFailed / TurnCompleted are now surfaced publicly (see
     // `turn_lifecycle_events_surface_completion_markers`).
     let rows = vec![
         project(Payload::TurnStarted(TurnStarted {
             turn_id: "turn-1".into(),
-        })),
-        project(Payload::AttentionRequired(event::AttentionRequired {
-            reason: "permission".into(),
         })),
         project(Payload::Log(event::LogLine {
             level: "info".into(),

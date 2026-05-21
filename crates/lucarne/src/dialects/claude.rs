@@ -1306,11 +1306,10 @@ impl Claude {
                     let call =
                         event::tool_call(name.as_str(), input.clone().unwrap_or(Value::Null));
                     out.push(tl(event::new_timeline_tool_call(&tid, call)));
-                    if let Some((req, attn)) =
+                    if let Some(req) =
                         self.synthesize_question_permission(&tid, &name, input.as_ref())
                     {
                         out.push(req);
-                        out.push(attn);
                     }
                 }
                 _ => {}
@@ -1372,11 +1371,6 @@ impl Claude {
             .to_string();
         let input = raw.and_then(|v| v.get("input").cloned());
         let questions = project_questions(input.as_ref());
-        let reason = if tool == "AskUserQuestion" && !questions.is_empty() {
-            "question"
-        } else {
-            "permission"
-        };
         self.pending.insert(
             req_id.to_string(),
             PendingPermission {
@@ -1385,18 +1379,13 @@ impl Claude {
                 questions: questions.clone(),
             },
         );
-        vec![
-            Event::new(Payload::PermissionRequest(PermissionRequest {
-                req_id: req_id.to_string(),
-                tool: tool.clone(),
-                input,
-                risk: risk_of(&tool),
-                questions,
-            })),
-            Event::new(Payload::AttentionRequired(event::AttentionRequired {
-                reason: reason.to_string(),
-            })),
-        ]
+        vec![Event::new(Payload::PermissionRequest(PermissionRequest {
+            req_id: req_id.to_string(),
+            tool: tool.clone(),
+            input,
+            risk: risk_of(&tool),
+            questions,
+        }))]
     }
 
     fn synthesize_question_permission(
@@ -1404,7 +1393,7 @@ impl Claude {
         tool_use_id: &str,
         tool_name: &str,
         input: Option<&Value>,
-    ) -> Option<(Event, Event)> {
+    ) -> Option<Event> {
         if tool_name != "AskUserQuestion" {
             return None;
         }
@@ -1425,18 +1414,13 @@ impl Claude {
                 questions: questions.clone(),
             },
         );
-        Some((
-            Event::new(Payload::PermissionRequest(PermissionRequest {
-                req_id,
-                tool: tool_name.to_string(),
-                input: input.cloned(),
-                risk: risk_of(tool_name),
-                questions,
-            })),
-            Event::new(Payload::AttentionRequired(event::AttentionRequired {
-                reason: "question".into(),
-            })),
-        ))
+        Some(Event::new(Payload::PermissionRequest(PermissionRequest {
+            req_id,
+            tool: tool_name.to_string(),
+            input: input.cloned(),
+            risk: risk_of(tool_name),
+            questions,
+        })))
     }
 }
 

@@ -43,7 +43,7 @@ use crate::{
     },
     error::{LucarneError, Result},
     event::{
-        self, AttentionRequired, Event, LogLine, Payload, PermissionAnswer, PermissionQuestion,
+        self, Event, LogLine, Payload, PermissionAnswer, PermissionQuestion,
         PermissionQuestionOption, PermissionRequest, PermissionResponse, ResumeHandle, Risk,
         SessionClosed, SessionStarted, Timeline, TimelineItem, ToolCall, ToolResult, TurnCompleted,
         TurnFailed, Usage, UsageDelta,
@@ -1962,18 +1962,13 @@ impl Codex {
             Some(cmd) if !cmd.is_empty() => risk_from_command(cmd),
             _ => Risk::Medium,
         };
-        vec![
-            Event::new(Payload::AttentionRequired(AttentionRequired {
-                reason: "permission".into(),
-            })),
-            Event::new(Payload::PermissionRequest(PermissionRequest {
-                req_id: lucarne_id,
-                tool,
-                input: Some(Value::Object(input_map)),
-                risk,
-                questions: Vec::new(),
-            })),
-        ]
+        vec![Event::new(Payload::PermissionRequest(PermissionRequest {
+            req_id: lucarne_id,
+            tool,
+            input: Some(Value::Object(input_map)),
+            risk,
+            questions: Vec::new(),
+        }))]
     }
 
     fn enrich_file_change_approval_input(&self, input_map: &mut Map<String, Value>) {
@@ -2065,9 +2060,6 @@ impl Codex {
                         Some(Value::Object(input_map.clone())),
                     ),
                 ),
-            })),
-            Event::new(Payload::AttentionRequired(AttentionRequired {
-                reason: "question".into(),
             })),
             Event::new(Payload::PermissionRequest(PermissionRequest {
                 req_id: lucarne_id,

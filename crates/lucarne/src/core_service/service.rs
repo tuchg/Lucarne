@@ -21,9 +21,9 @@ use tracing::{debug, info, instrument, trace, warn};
 
 use crate::{
     agent_runtime::{
-        AgentCommandResult, AgentError, AgentEventStream, AgentRuntime, AgentSession, AgentStatus,
-        Event as AgentEvent, InterventionResponse, KnownAgentProvider, OpenSession, ResumeSession,
-        SessionRef,
+        AgentActivityStream, AgentCommandResult, AgentError, AgentEventStream, AgentRuntime,
+        AgentSession, AgentStatus, Event as AgentEvent, InterventionResponse, KnownAgentProvider,
+        OpenSession, ResumeSession, SessionRef,
     },
     control_plane::{
         ActivationPlan, ActivationRequest, ChannelBinding, ChannelBindingId, CommandCallbackRecord,
@@ -109,7 +109,6 @@ pub struct LucarneCore {
 
 #[derive(Debug, Clone)]
 struct SubmittedTurnActivity {
-    started_at: Instant,
     last_event_at: Instant,
     waiting_intervention: bool,
 }
@@ -1106,6 +1105,7 @@ impl LucarneCore {
         };
         let session = self.runtime.open(req.provider_id, open).await?;
         let events_source = session.take_events().await?;
+        let activity_source = session.take_activity_events().await?;
         let session = Arc::<dyn AgentSession>::from(session);
         let live_instance_id = live_instance_id(session.instance_id().0.as_str());
         let workspace = self.record_live_workspace(
@@ -1122,6 +1122,7 @@ impl LucarneCore {
             live_generation,
             Arc::clone(&session),
             events_source,
+            activity_source,
         );
         info!(
             target: "lucarne::core_service",
@@ -1213,6 +1214,7 @@ impl LucarneCore {
             )
             .await?;
         let events_source = session.take_events().await?;
+        let activity_source = session.take_activity_events().await?;
         let session = Arc::<dyn AgentSession>::from(session);
         let live_instance_id = live_instance_id(session.instance_id().0.as_str());
         let workspace = self.attach_live_session_record(
@@ -1229,6 +1231,7 @@ impl LucarneCore {
             live_generation,
             Arc::clone(&session),
             events_source,
+            activity_source,
         );
         info!(
             target: "lucarne::core_service",
@@ -1326,11 +1329,7 @@ impl LucarneCore {
             "submitting turn"
         );
         self.remember_submitted_turn(workspace_id.clone(), turn_id.clone());
-        self.spawn_submitted_turn_watchdog(
-            workspace_id.clone(),
-            turn_id.clone(),
-            Arc::clone(&live),
-        );
+        self.spawn_submitted_turn_watchdog(workspace_id.clone(), turn_id.clone());
         if let Err(err) = live.submit(input).await {
             self.remove_submitted_turn(&workspace_id, &turn_id);
             return Err(err.into());
@@ -1920,6 +1919,7 @@ impl LucarneCore {
         live_generation: u64,
         session: Arc<dyn AgentSession>,
         mut source_events: AgentEventStream,
+        mut activity_source: Option<AgentActivityStream>,
     ) {
         let events = self.events.clone();
         let workspace_events = self.workspace_event_sender(&workspace_id);
@@ -1938,107 +1938,142 @@ impl LucarneCore {
                 live_generation,
                 "spawn_event_pump started"
             );
-            while let Some(event) = source_events.recv().await {
-                if !live_generation_matches(
-                    &live_session_generations,
-                    &workspace_id,
-                    live_generation,
-                ) {
-                    debug!(
-                        target: "lucarne::core_service",
-                        workspace_id = %workspace_id.as_str(),
-                        live_generation,
-                        "provider event pump stopped after live session was replaced"
-                    );
-                    return;
-                }
-                let turn_id = current_submitted_turn(&submitted_turns, &workspace_id);
-                if let Some(turn_id) = turn_id.as_ref() {
-                    touch_submitted_turn(&submitted_turn_activity, turn_id, &event);
-                }
-                if let AgentEvent::Message(message) = &event {
-                    if message.role == crate::agent_runtime::MessageRole::Assistant
-                        && !message.streaming
-                    {
-                        if let Some(text) = terminal_text_claim_text(message.text.as_ref()) {
-                            last_assistant_message = Some(text);
+            loop {
+                tokio::select! {
+                    biased;
+                    activity = recv_agent_activity(&mut activity_source) => {
+                        if activity.is_none() {
+                            activity_source = None;
+                            continue;
                         }
+                        if !live_generation_matches(
+                            &live_session_generations,
+                            &workspace_id,
+                            live_generation,
+                        ) {
+                            debug!(
+                                target: "lucarne::core_service",
+                                workspace_id = %workspace_id.as_str(),
+                                live_generation,
+                                "provider activity pump stopped after live session was replaced"
+                            );
+                            return;
+                        }
+                        if let Some(turn_id) = current_submitted_turn(&submitted_turns, &workspace_id) {
+                            touch_submitted_turn_agent_activity(&submitted_turn_activity, &turn_id);
+                        }
+                        trace!(
+                            target: "lucarne::core_service",
+                            workspace_id = %workspace_id.as_str(),
+                            "provider activity pumped"
+                        );
                     }
-                }
-                let lifecycle = match &event {
-                    AgentEvent::TurnCompleted(completed) => {
-                        if turn_id.is_some() {
-                            let native_session = session
-                                .provider_session_id()
-                                .await
-                                .unwrap_or_else(|| session.id().clone());
-                            let native_provider_session_id = provider_session_id(
-                                provider_id.as_str(),
-                                native_session.0.as_str(),
+                    maybe_event = source_events.recv() => {
+                        let Some(event) = maybe_event else {
+                            break;
+                        };
+                        if !live_generation_matches(
+                            &live_session_generations,
+                            &workspace_id,
+                            live_generation,
+                        ) {
+                            debug!(
+                                target: "lucarne::core_service",
+                                workspace_id = %workspace_id.as_str(),
+                                live_generation,
+                                "provider event pump stopped after live session was replaced"
                             );
-                            remember_live_runtime_turn_claim(
-                                &live_runtime_turn_claims,
-                                native_provider_session_id.clone(),
-                                completed.turn_id.clone(),
-                            );
-                            if completed.turn_id.trim().is_empty() {
-                                if let Some(text) = last_assistant_message.take() {
-                                    remember_live_runtime_terminal_text_claim(
-                                        &live_runtime_terminal_text_claims,
-                                        native_provider_session_id,
-                                        text,
-                                    );
+                            return;
+                        }
+                        let turn_id = current_submitted_turn(&submitted_turns, &workspace_id);
+                        if let Some(turn_id) = turn_id.as_ref() {
+                            touch_submitted_turn(&submitted_turn_activity, turn_id, &event);
+                        }
+                        if let AgentEvent::Message(message) = &event {
+                            if message.role == crate::agent_runtime::MessageRole::Assistant
+                                && !message.streaming
+                            {
+                                if let Some(text) = terminal_text_claim_text(message.text.as_ref()) {
+                                    last_assistant_message = Some(text);
                                 }
                             }
                         }
-                        last_assistant_message = None;
-                        Some(CoreEvent::TurnCompleted {
+                        let lifecycle = match &event {
+                            AgentEvent::TurnCompleted(completed) => {
+                                if turn_id.is_some() {
+                                    let native_session = session
+                                        .provider_session_id()
+                                        .await
+                                        .unwrap_or_else(|| session.id().clone());
+                                    let native_provider_session_id = provider_session_id(
+                                        provider_id.as_str(),
+                                        native_session.0.as_str(),
+                                    );
+                                    remember_live_runtime_turn_claim(
+                                        &live_runtime_turn_claims,
+                                        native_provider_session_id.clone(),
+                                        completed.turn_id.clone(),
+                                    );
+                                    if completed.turn_id.trim().is_empty() {
+                                        if let Some(text) = last_assistant_message.take() {
+                                            remember_live_runtime_terminal_text_claim(
+                                                &live_runtime_terminal_text_claims,
+                                                native_provider_session_id,
+                                                text,
+                                            );
+                                        }
+                                    }
+                                }
+                                last_assistant_message = None;
+                                Some(CoreEvent::TurnCompleted {
+                                    workspace_id: workspace_id.clone(),
+                                })
+                            }
+                            AgentEvent::TurnFailed(failed) => {
+                                if turn_id.is_some() {
+                                    let native_session = session
+                                        .provider_session_id()
+                                        .await
+                                        .unwrap_or_else(|| session.id().clone());
+                                    remember_live_runtime_turn_claim(
+                                        &live_runtime_turn_claims,
+                                        provider_session_id(
+                                            provider_id.as_str(),
+                                            native_session.0.as_str(),
+                                        ),
+                                        failed.turn_id.clone(),
+                                    );
+                                }
+                                last_assistant_message = None;
+                                Some(CoreEvent::TurnFailed {
+                                    workspace_id: workspace_id.clone(),
+                                    error: failed.error.to_string(),
+                                })
+                            }
+                            _ => None,
+                        };
+                        let workspace_event = event.clone();
+                        let _ = events.send(CoreEvent::TimelineEvent {
                             workspace_id: workspace_id.clone(),
-                        })
-                    }
-                    AgentEvent::TurnFailed(failed) => {
-                        if turn_id.is_some() {
-                            let native_session = session
-                                .provider_session_id()
-                                .await
-                                .unwrap_or_else(|| session.id().clone());
-                            remember_live_runtime_turn_claim(
-                                &live_runtime_turn_claims,
-                                provider_session_id(
-                                    provider_id.as_str(),
-                                    native_session.0.as_str(),
-                                ),
-                                failed.turn_id.clone(),
-                            );
-                        }
-                        last_assistant_message = None;
-                        Some(CoreEvent::TurnFailed {
-                            workspace_id: workspace_id.clone(),
-                            error: failed.error.to_string(),
-                        })
-                    }
-                    _ => None,
-                };
-                let workspace_event = event.clone();
-                let _ = events.send(CoreEvent::TimelineEvent {
-                    workspace_id: workspace_id.clone(),
-                    turn_id: turn_id.clone(),
-                    event,
-                });
-                let _ = workspace_events.send(workspace_event);
-                trace!(
-                    target: "lucarne::core_service",
-                    workspace_id = %workspace_id.as_str(),
-                    "provider event pumped"
-                );
-                if let Some(lifecycle) = lifecycle {
-                    let _ = events.send(lifecycle);
-                    if turn_id.is_some() {
-                        pop_submitted_turn(
-                            &submitted_turns,
-                            &submitted_turn_activity,
-                            &workspace_id,
+                            turn_id: turn_id.clone(),
+                            event,
+                        });
+                        let _ = workspace_events.send(workspace_event);
+                        trace!(
+                            target: "lucarne::core_service",
+                            workspace_id = %workspace_id.as_str(),
+                            "provider event pumped"
                         );
+                        if let Some(lifecycle) = lifecycle {
+                            let _ = events.send(lifecycle);
+                            if turn_id.is_some() {
+                                pop_submitted_turn(
+                                    &submitted_turns,
+                                    &submitted_turn_activity,
+                                    &workspace_id,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -3197,7 +3232,6 @@ impl LucarneCore {
             .insert(
                 turn_id,
                 SubmittedTurnActivity {
-                    started_at: now,
                     last_event_at: now,
                     waiting_intervention: false,
                 },
@@ -3218,18 +3252,11 @@ impl LucarneCore {
             .remove(turn_id);
     }
 
-    fn spawn_submitted_turn_watchdog(
-        &self,
-        workspace_id: WorkspaceId,
-        turn_id: TurnId,
-        live: Arc<dyn AgentSession>,
-    ) {
+    fn spawn_submitted_turn_watchdog(&self, workspace_id: WorkspaceId, turn_id: TurnId) {
         let events = self.events.clone();
         let workspace_events = self.workspace_event_sender(&workspace_id);
         let submitted_turns = Arc::clone(&self.submitted_turns);
         let submitted_turn_activity = Arc::clone(&self.submitted_turn_activity);
-        let live_sessions = Arc::clone(&self.live_sessions);
-        let live_session_generations = Arc::clone(&self.live_session_generations);
         let options = self.options.clone();
         tokio::spawn(async move {
             loop {
@@ -3264,20 +3291,12 @@ impl LucarneCore {
                 ) {
                     return;
                 }
-                live_sessions
-                    .write()
-                    .expect("live session registry lock")
-                    .remove(&workspace_id);
-                live_session_generations
-                    .write()
-                    .expect("live session generation lock")
-                    .remove(&workspace_id);
                 warn!(
                     target: "lucarne::core_service",
                     workspace_id = %workspace_id.as_str(),
                     turn_id = %turn_id.as_str(),
                     error = %error,
-                    "submitted turn watchdog failed stuck live turn"
+                    "submitted turn watchdog failed stuck live turn without closing live session"
                 );
                 emit_submitted_turn_failure(
                     &events,
@@ -3286,27 +3305,16 @@ impl LucarneCore {
                     &turn_id,
                     error,
                 );
-                if let Err(err) = live.interrupt().await {
-                    warn!(
-                        target: "lucarne::core_service",
-                        workspace_id = %workspace_id.as_str(),
-                        turn_id = %turn_id.as_str(),
-                        error = %err,
-                        "interrupt after submitted turn timeout failed"
-                    );
-                }
-                if let Err(err) = live.close().await {
-                    warn!(
-                        target: "lucarne::core_service",
-                        workspace_id = %workspace_id.as_str(),
-                        turn_id = %turn_id.as_str(),
-                        error = %err,
-                        "close after submitted turn timeout failed"
-                    );
-                }
                 return;
             }
         });
+    }
+}
+
+async fn recv_agent_activity(activity_source: &mut Option<AgentActivityStream>) -> Option<()> {
+    match activity_source.as_mut() {
+        Some(activity_source) => activity_source.recv().await,
+        None => std::future::pending::<Option<()>>().await,
     }
 }
 
@@ -3654,6 +3662,18 @@ fn mark_current_submitted_turn_intervention_resolved(
     turn.waiting_intervention = false;
 }
 
+fn touch_submitted_turn_agent_activity(
+    activity: &Arc<RwLock<HashMap<TurnId, SubmittedTurnActivity>>>,
+    turn_id: &TurnId,
+) {
+    let mut activity = activity.write().expect("submitted turn activity lock");
+    let Some(turn) = activity.get_mut(turn_id) else {
+        return;
+    };
+    turn.last_event_at = Instant::now();
+    turn.waiting_intervention = false;
+}
+
 fn touch_submitted_turn(
     activity: &Arc<RwLock<HashMap<TurnId, SubmittedTurnActivity>>>,
     turn_id: &TurnId,
@@ -3664,20 +3684,7 @@ fn touch_submitted_turn(
         return;
     };
     turn.last_event_at = Instant::now();
-    match event {
-        AgentEvent::InterventionRequest(_) => {
-            turn.waiting_intervention = true;
-        }
-        AgentEvent::Message(_)
-        | AgentEvent::Attachment(_)
-        | AgentEvent::Reasoning(_)
-        | AgentEvent::ToolCall(_)
-        | AgentEvent::ToolResult(_)
-        | AgentEvent::CommandResult(_) => {
-            turn.waiting_intervention = false;
-        }
-        AgentEvent::Usage(_) | AgentEvent::TurnCompleted(_) | AgentEvent::TurnFailed(_) => {}
-    }
+    turn.waiting_intervention = matches!(event, AgentEvent::InterventionRequest(_));
 }
 
 fn submitted_turn_timeout_error(
@@ -3691,17 +3698,16 @@ fn submitted_turn_timeout_error(
         .expect("submitted turn activity lock")
         .get(turn_id)
         .cloned()?;
-    let total = now.saturating_duration_since(turn.started_at);
-    if total >= options.turn_deadline {
+    let idle = now.saturating_duration_since(turn.last_event_at);
+    if idle >= options.turn_deadline {
         return Some(format!(
-            "agent turn deadline reached after {} without turn_complete signal",
+            "agent turn deadline reached after {} since last activity without turn_complete signal",
             format_duration_ms(options.turn_deadline.as_millis() as u64)
         ));
     }
     if turn.waiting_intervention {
         return None;
     }
-    let idle = now.saturating_duration_since(turn.last_event_at);
     if idle >= options.turn_inactivity {
         return Some(format!(
             "agent went silent for {} after last event (no turn_complete signal)",
@@ -3722,12 +3728,11 @@ fn submitted_turn_timeout_delay(
         .expect("submitted turn activity lock")
         .get(turn_id)
         .cloned()?;
-    let total = now.saturating_duration_since(turn.started_at);
-    let deadline_remaining = options.turn_deadline.saturating_sub(total);
+    let idle = now.saturating_duration_since(turn.last_event_at);
+    let deadline_remaining = options.turn_deadline.saturating_sub(idle);
     if deadline_remaining.is_zero() || turn.waiting_intervention {
         return Some(deadline_remaining);
     }
-    let idle = now.saturating_duration_since(turn.last_event_at);
     let inactivity_remaining = options.turn_inactivity.saturating_sub(idle);
     Some(deadline_remaining.min(inactivity_remaining))
 }
@@ -4370,14 +4375,13 @@ mod tests {
     }
 
     #[test]
-    fn submitted_turn_intervention_wait_survives_usage_events() {
+    fn submitted_turn_runtime_activity_clears_intervention_wait() {
         let activity = Arc::new(RwLock::new(HashMap::new()));
         let turn_id = TurnId::new("turn-waiting-intervention");
         let now = Instant::now();
         activity.write().expect("activity lock").insert(
             turn_id.clone(),
             SubmittedTurnActivity {
-                started_at: now,
                 last_event_at: now,
                 waiting_intervention: false,
             },
@@ -4393,6 +4397,13 @@ mod tests {
                 input: None,
             })),
         );
+        let after_intervention_activity = activity
+            .read()
+            .expect("activity lock")
+            .get(&turn_id)
+            .expect("submitted turn activity")
+            .last_event_at;
+        std::thread::sleep(Duration::from_millis(5));
         touch_submitted_turn(
             &activity,
             &turn_id,
@@ -4403,17 +4414,26 @@ mod tests {
                 raw: serde_json::json!({ "source": "bookkeeping" }),
             }),
         );
+        let after_usage_activity = activity
+            .read()
+            .expect("activity lock")
+            .get(&turn_id)
+            .expect("submitted turn activity")
+            .last_event_at;
+        assert!(
+            after_usage_activity > after_intervention_activity,
+            "any runtime stdio event should refresh submitted-turn activity"
+        );
 
         let test_opts = CoreOptions {
             turn_inactivity: Duration::from_millis(50),
             turn_deadline: Duration::from_millis(250),
             session_idle_timeout: Duration::from_millis(500),
         };
-        let check_at = Instant::now() + test_opts.turn_inactivity + test_opts.turn_inactivity;
-        assert!(
-            submitted_turn_timeout_error(&activity, &turn_id, check_at, &test_opts).is_none(),
-            "bookkeeping usage must not clear an outstanding intervention wait"
-        );
+        let check_at = after_usage_activity + test_opts.turn_inactivity + test_opts.turn_inactivity;
+        let error = submitted_turn_timeout_error(&activity, &turn_id, check_at, &test_opts)
+            .expect("runtime activity should clear an outstanding intervention wait");
+        assert!(error.contains("agent went silent"));
     }
 
     #[test]
@@ -4430,7 +4450,6 @@ mod tests {
         activity.write().expect("activity lock").insert(
             turn_id.clone(),
             SubmittedTurnActivity {
-                started_at: now,
                 last_event_at: now,
                 waiting_intervention: true,
             },
@@ -4461,7 +4480,6 @@ mod tests {
         activity.write().expect("activity lock").insert(
             turn_id.clone(),
             SubmittedTurnActivity {
-                started_at: now,
                 last_event_at: now,
                 waiting_intervention: false,
             },
@@ -4504,7 +4522,6 @@ mod tests {
         activity.write().expect("activity lock").insert(
             turn_id.clone(),
             SubmittedTurnActivity {
-                started_at: now,
                 last_event_at: now + Duration::from_millis(40),
                 waiting_intervention: false,
             },
@@ -4527,6 +4544,36 @@ mod tests {
         assert_eq!(
             submitted_turn_timeout_delay(&activity, &turn_id, timeout_at, &test_opts),
             Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn submitted_turn_deadline_uses_last_activity_window() {
+        let activity = Arc::new(RwLock::new(HashMap::new()));
+        let turn_id = TurnId::new("turn-active-past-total-deadline");
+        let now = Instant::now();
+        activity.write().expect("activity lock").insert(
+            turn_id.clone(),
+            SubmittedTurnActivity {
+                last_event_at: now + Duration::from_millis(240),
+                waiting_intervention: false,
+            },
+        );
+        let test_opts = CoreOptions {
+            turn_inactivity: Duration::from_millis(500),
+            turn_deadline: Duration::from_millis(250),
+            session_idle_timeout: Duration::from_millis(500),
+        };
+
+        let check_at = now + Duration::from_millis(300);
+        assert!(
+            submitted_turn_timeout_error(&activity, &turn_id, check_at, &test_opts).is_none(),
+            "recent activity should prevent deadline timeout even when total turn duration exceeds deadline"
+        );
+        assert_eq!(
+            submitted_turn_timeout_delay(&activity, &turn_id, check_at, &test_opts),
+            Some(Duration::from_millis(190)),
+            "deadline should be measured from last activity, not turn start"
         );
     }
 
@@ -5558,8 +5605,17 @@ mod tests {
         for provider_id in ["codex", "pi"] {
             let session_id = format!("{provider_id}-live-thread");
             let fixture = live_history_fixture_for_provider(provider_id, &session_id).await;
-            submit_noop_turn(&fixture.core, &fixture.workspace_id).await;
+            let submitted = submit_noop_turn(&fixture.core, &fixture.workspace_id).await;
+            let before_watch_activity = fixture
+                .core
+                .submitted_turn_activity
+                .read()
+                .expect("activity lock")
+                .get(&submitted.turn_id)
+                .expect("submitted turn activity")
+                .last_event_at;
             let mut events = fixture.core.watch_events();
+            tokio::time::sleep(Duration::from_millis(5)).await;
 
             fixture
                 .core
@@ -5573,6 +5629,18 @@ mod tests {
                 ))
                 .expect("ingest live echo watch update");
 
+            let after_watch_activity = fixture
+                .core
+                .submitted_turn_activity
+                .read()
+                .expect("activity lock")
+                .get(&submitted.turn_id)
+                .expect("submitted turn activity")
+                .last_event_at;
+            assert_eq!(
+                after_watch_activity, before_watch_activity,
+                "{provider_id} submitted-turn history echo must not count as watchdog activity"
+            );
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), async {
                     loop {
@@ -5597,6 +5665,71 @@ mod tests {
                 "{provider_id} submitted-turn history echo must not emit duplicate watch events"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_activity_without_public_event_refreshes_submitted_turn() {
+        let activity_state = Arc::new(RawActivitySessionState::default());
+        let runtime = Arc::new(AgentRuntime::new());
+        runtime.register(Arc::new(RawActivityProvider {
+            state: Arc::clone(&activity_state),
+        }));
+        let core = LucarneCore::from_runtime_and_store_with_options(
+            runtime,
+            ControlPlaneSqliteStore::open_in_memory().expect("store"),
+            CoreOptions {
+                turn_inactivity: Duration::from_millis(500),
+                turn_deadline: Duration::from_millis(1000),
+                session_idle_timeout: Duration::from_millis(1000),
+            },
+        )
+        .expect("core");
+        let opened = core
+            .open_workspace_with_events(OpenWorkspaceRequest {
+                provider_id: "codex",
+                project_path: Some(PathBuf::from("/tmp/raw-activity")),
+                title: "raw activity".into(),
+            })
+            .await
+            .expect("open workspace");
+        let submitted = core
+            .submit_turn(SubmitTurnRequest {
+                workspace_id: opened.workspace.workspace_id.clone(),
+                input: crate::agent_runtime::AgentInput {
+                    text: "please continue".into(),
+                    images: Vec::new(),
+                },
+            })
+            .await
+            .expect("submit turn");
+        let before_activity = {
+            let mut activity = core.submitted_turn_activity.write().expect("activity lock");
+            let turn = activity
+                .get_mut(&submitted.turn_id)
+                .expect("submitted turn activity");
+            turn.waiting_intervention = true;
+            turn.last_event_at
+        };
+
+        activity_state.emit().await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let current = core
+                    .submitted_turn_activity
+                    .read()
+                    .expect("activity lock")
+                    .get(&submitted.turn_id)
+                    .cloned()
+                    .expect("submitted turn activity");
+                if current.last_event_at > before_activity && !current.waiting_intervention {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("raw runtime activity should refresh submitted-turn activity");
     }
 
     #[tokio::test]
@@ -5920,11 +6053,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_submitted_turn_times_out_and_detaches_live_session() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock");
-        let fixture = live_history_fixture("hung-thread").await;
-        let mut events = fixture.core.watch_events();
-        let submitted = submit_noop_turn(&fixture.core, &fixture.workspace_id).await;
+    async fn live_submitted_turn_timeout_fails_wait_without_closing_live_session() {
+        let session_state = Arc::new(RecordingSessionState::default());
+        let runtime = Arc::new(AgentRuntime::new());
+        runtime.register(Arc::new(RecordingProvider {
+            state: Arc::clone(&session_state),
+        }));
+        let core = LucarneCore::from_runtime_and_store_with_options(
+            runtime,
+            ControlPlaneSqliteStore::open_in_memory().expect("store"),
+            CoreOptions {
+                turn_inactivity: Duration::from_millis(50),
+                turn_deadline: Duration::from_millis(250),
+                session_idle_timeout: Duration::from_millis(500),
+            },
+        )
+        .expect("core");
+        let opened = core
+            .open_workspace_with_events(OpenWorkspaceRequest {
+                provider_id: "codex",
+                project_path: Some(PathBuf::from("/tmp/timeout-no-close")),
+                title: "timeout no close".into(),
+            })
+            .await
+            .expect("open workspace");
+        let workspace_id = opened.workspace.workspace_id.clone();
+        let mut events = core.watch_events();
+        let submitted = core
+            .submit_turn(SubmitTurnRequest {
+                workspace_id: workspace_id.clone(),
+                input: crate::agent_runtime::AgentInput {
+                    text: "please continue".into(),
+                    images: Vec::new(),
+                },
+            })
+            .await
+            .expect("submit turn");
 
         let (failed_turn_id, error) = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -5941,13 +6105,16 @@ mod tests {
         })
         .await
         .expect("submitted turn timeout failure");
+        tokio::time::sleep(Duration::from_millis(20)).await;
 
         assert_eq!(failed_turn_id, submitted.turn_id);
         assert!(error.contains("agent went silent"));
         assert!(
-            !fixture.core.has_live_session(&fixture.workspace_id),
-            "timed-out submitted turn should detach the wedged live session"
+            core.has_live_session(&workspace_id),
+            "timed-out submitted turn should leave live session/process running"
         );
+        assert_eq!(session_state.interrupt_count(), 0);
+        assert_eq!(session_state.close_count(), 0);
     }
 
     #[tokio::test]
@@ -6670,6 +6837,105 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct RawActivitySessionState {
+        tx: StdMutex<Option<tokio::sync::mpsc::Sender<()>>>,
+    }
+
+    impl RawActivitySessionState {
+        async fn emit(&self) {
+            let tx = self
+                .tx
+                .lock()
+                .expect("raw activity tx lock")
+                .clone()
+                .expect("raw activity tx");
+            tx.send(()).await.expect("send raw activity");
+        }
+    }
+
+    struct RawActivityProvider {
+        state: Arc<RawActivitySessionState>,
+    }
+
+    #[async_trait]
+    impl AgentProvider for RawActivityProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId::from_static("codex")
+        }
+
+        async fn probe(&self) -> Result<ProbeResult, AgentError> {
+            Ok(ProbeResult {
+                provider_id: ProviderId::from_static("codex"),
+                provider_version: Some("test".into()),
+                capabilities: Default::default(),
+            })
+        }
+
+        async fn open(&self, _req: OpenSession) -> Result<Box<dyn AgentSession>, AgentError> {
+            Ok(Box::new(RawActivitySession::new(
+                "raw-activity-session-open",
+                Arc::clone(&self.state),
+            )))
+        }
+
+        async fn resume(&self, req: ResumeSession) -> Result<Box<dyn AgentSession>, AgentError> {
+            Ok(Box::new(RawActivitySession::new(
+                req.session_ref.0.as_str(),
+                Arc::clone(&self.state),
+            )))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSessionState {
+        interrupt_count: StdMutex<usize>,
+        close_count: StdMutex<usize>,
+    }
+
+    impl RecordingSessionState {
+        fn interrupt_count(&self) -> usize {
+            *self.interrupt_count.lock().expect("interrupt count lock")
+        }
+
+        fn close_count(&self) -> usize {
+            *self.close_count.lock().expect("close count lock")
+        }
+    }
+
+    struct RecordingProvider {
+        state: Arc<RecordingSessionState>,
+    }
+
+    #[async_trait]
+    impl AgentProvider for RecordingProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId::from_static("codex")
+        }
+
+        async fn probe(&self) -> Result<ProbeResult, AgentError> {
+            Ok(ProbeResult {
+                provider_id: ProviderId::from_static("codex"),
+                provider_version: Some("test".into()),
+                capabilities: Default::default(),
+            })
+        }
+
+        async fn open(&self, _req: OpenSession) -> Result<Box<dyn AgentSession>, AgentError> {
+            Ok(Box::new(RecordingSession::new(
+                "recording-session-open",
+                Arc::clone(&self.state),
+            )))
+        }
+
+        async fn resume(&self, req: ResumeSession) -> Result<Box<dyn AgentSession>, AgentError> {
+            Ok(Box::new(RecordingSession::new(
+                req.session_ref.0.as_str(),
+                Arc::clone(&self.state),
+            )))
+        }
+    }
+
+    #[derive(Default)]
     struct CompletingProvider {
         next: StdMutex<u64>,
     }
@@ -6781,6 +7047,154 @@ mod tests {
         }
 
         async fn close(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    struct RawActivitySession {
+        id: SessionId,
+        instance_id: InstanceId,
+        _events_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        events: StdMutex<Option<AgentEventStream>>,
+        activity: StdMutex<Option<AgentActivityStream>>,
+    }
+
+    impl RawActivitySession {
+        fn new(id: &str, state: Arc<RawActivitySessionState>) -> Self {
+            let (events_tx, events_rx) = tokio::sync::mpsc::channel(1);
+            let (activity_tx, activity_rx) = tokio::sync::mpsc::channel(16);
+            *state.tx.lock().expect("raw activity tx lock") = Some(activity_tx);
+            Self {
+                id: SessionId(id.into()),
+                instance_id: InstanceId(format!("instance-{id}").into()),
+                _events_tx: events_tx,
+                events: StdMutex::new(Some(events_rx)),
+                activity: StdMutex::new(Some(activity_rx)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentSession for RawActivitySession {
+        fn id(&self) -> &SessionId {
+            &self.id
+        }
+
+        fn instance_id(&self) -> &InstanceId {
+            &self.instance_id
+        }
+
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::from_static("codex")
+        }
+
+        async fn submit(&self, _input: crate::agent_runtime::AgentInput) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn interrupt(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn resolve(
+            &self,
+            _req_id: &str,
+            _response: crate::agent_runtime::InterventionResponse,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn take_events(&self) -> Result<AgentEventStream, AgentError> {
+            Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .take()
+                .expect("events already taken"))
+        }
+
+        async fn take_activity_events(&self) -> Result<Option<AgentActivityStream>, AgentError> {
+            Ok(Some(
+                self.activity
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("activity already taken"),
+            ))
+        }
+
+        async fn close(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+    }
+
+    struct RecordingSession {
+        id: SessionId,
+        instance_id: InstanceId,
+        state: Arc<RecordingSessionState>,
+        _tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        events: StdMutex<Option<AgentEventStream>>,
+    }
+
+    impl RecordingSession {
+        fn new(id: &str, state: Arc<RecordingSessionState>) -> Self {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            Self {
+                id: SessionId(id.into()),
+                instance_id: InstanceId(format!("instance-{id}").into()),
+                state,
+                _tx: tx,
+                events: StdMutex::new(Some(rx)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentSession for RecordingSession {
+        fn id(&self) -> &SessionId {
+            &self.id
+        }
+
+        fn instance_id(&self) -> &InstanceId {
+            &self.instance_id
+        }
+
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::from_static("codex")
+        }
+
+        async fn submit(&self, _input: crate::agent_runtime::AgentInput) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn interrupt(&self) -> Result<(), AgentError> {
+            *self
+                .state
+                .interrupt_count
+                .lock()
+                .expect("interrupt count lock") += 1;
+            Ok(())
+        }
+
+        async fn resolve(
+            &self,
+            _req_id: &str,
+            _response: crate::agent_runtime::InterventionResponse,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn take_events(&self) -> Result<AgentEventStream, AgentError> {
+            Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .take()
+                .expect("events already taken"))
+        }
+
+        async fn close(&self) -> Result<(), AgentError> {
+            *self.state.close_count.lock().expect("close count lock") += 1;
             Ok(())
         }
     }

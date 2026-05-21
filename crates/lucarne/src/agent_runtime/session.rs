@@ -21,12 +21,12 @@ use crate::{
 };
 
 use super::{
-    AgentCapabilities, AgentCommandCatalog, AgentCommandCompletion, AgentCommandInvocation,
-    AgentCommandResult, AgentCommandResultData, AgentCommandSource, AgentError, AgentErrorKind,
-    AgentEventStream, AgentForkResult, AgentForkSelection, AgentForkTargetCatalog, AgentInput,
-    AgentModelCatalog, AgentModelSelection, AgentPermissionCatalog, AgentPermissionSelection,
-    AgentSkillCatalog, AgentStatus, ApprovalDecision, InstanceId, InterventionResponse,
-    RuntimeBusFilter, SessionId,
+    AgentActivityStream, AgentCapabilities, AgentCommandCatalog, AgentCommandCompletion,
+    AgentCommandInvocation, AgentCommandResult, AgentCommandResultData, AgentCommandSource,
+    AgentError, AgentErrorKind, AgentEventStream, AgentForkResult, AgentForkSelection,
+    AgentForkTargetCatalog, AgentInput, AgentModelCatalog, AgentModelSelection,
+    AgentPermissionCatalog, AgentPermissionSelection, AgentSkillCatalog, AgentStatus,
+    ApprovalDecision, InstanceId, InterventionResponse, RuntimeBusFilter, SessionId,
 };
 
 const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
@@ -130,6 +130,7 @@ struct TypedCommandWaiter {
 enum IdleSignal {
     Busy,
     Idle,
+    Activity,
     Stop,
 }
 
@@ -205,6 +206,9 @@ pub trait AgentSession: Send + Sync {
     async fn resolve(&self, req_id: &str, response: InterventionResponse)
         -> Result<(), AgentError>;
     async fn take_events(&self) -> Result<AgentEventStream, AgentError>;
+    async fn take_activity_events(&self) -> Result<Option<AgentActivityStream>, AgentError> {
+        Ok(None)
+    }
     async fn close(&self) -> Result<(), AgentError>;
 
     #[doc(hidden)]
@@ -328,6 +332,7 @@ pub struct AgentSessionFacade {
     provider_ready_rx: AsyncMutex<watch::Receiver<bool>>,
     session: Arc<AsyncMutex<runtime::Session>>,
     events_rx: StdMutex<Option<AgentEventStream>>,
+    activity_rx: StdMutex<Option<AgentActivityStream>>,
     close_reason: Arc<StdRwLock<Option<SmolStr>>>,
     closing: Arc<ClosingState>,
     question_keys: Arc<StdRwLock<BTreeMap<String, Vec<Vec<String>>>>>,
@@ -424,6 +429,7 @@ impl AgentSessionFacade {
             .ok_or_else(|| invalid_state("internal session event stream already taken"))?;
         let session = Arc::new(AsyncMutex::new(session));
         let (public_tx, public_rx) = mpsc::channel(1024);
+        let (activity_tx, activity_rx) = mpsc::channel(16);
         let (ready_tx, ready_rx) = oneshot::channel();
         let (provider_ready_tx, provider_ready_rx) = watch::channel(false);
         let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -445,6 +451,7 @@ impl AgentSessionFacade {
             Arc::clone(&closing),
             Arc::clone(&question_keys),
             idle_tx.clone(),
+            activity_tx,
             control_rx,
         ));
 
@@ -582,6 +589,7 @@ impl AgentSessionFacade {
             provider_ready_rx: AsyncMutex::new(provider_ready_rx),
             session,
             events_rx: StdMutex::new(Some(public_rx)),
+            activity_rx: StdMutex::new(Some(activity_rx)),
             close_reason,
             closing,
             question_keys,
@@ -1041,6 +1049,23 @@ impl AgentSession for AgentSessionFacade {
             .ok_or_else(|| invalid_state("public event stream already taken"))
     }
 
+    async fn take_activity_events(&self) -> Result<Option<AgentActivityStream>, AgentError> {
+        debug!(
+            target: "lucarne::agent_runtime::session",
+            provider_id = %self.provider_id,
+            instance_id = %self.instance_id.0,
+            session_id = %self.session_id.0,
+            "taking activity event stream"
+        );
+        Ok(Some(
+            self.activity_rx
+                .lock()
+                .expect("activity event stream lock")
+                .take()
+                .ok_or_else(|| invalid_state("activity event stream already taken"))?,
+        ))
+    }
+
     async fn close(&self) -> Result<(), AgentError> {
         info!(
             target: "lucarne::agent_runtime::session",
@@ -1125,6 +1150,7 @@ async fn drain_events(
     closing: Arc<ClosingState>,
     question_keys: Arc<StdRwLock<BTreeMap<String, Vec<Vec<String>>>>>,
     idle_tx: mpsc::UnboundedSender<IdleSignal>,
+    activity_tx: mpsc::Sender<()>,
     mut control_rx: mpsc::UnboundedReceiver<DrainControl>,
 ) {
     debug!(
@@ -1197,6 +1223,7 @@ async fn drain_events(
                             closing.as_ref(),
                             &question_keys,
                             &idle_tx,
+                            &activity_tx,
                             &mut filter,
                             &mut pending_public,
                             &mut typed_command,
@@ -1242,6 +1269,7 @@ async fn drain_events(
                     closing.as_ref(),
                     &question_keys,
                     &idle_tx,
+                    &activity_tx,
                     &mut filter,
                     &mut pending_public,
                     &mut typed_command,
@@ -1262,6 +1290,7 @@ async fn drain_events(
                         &close_reason,
                         &question_keys,
                         &idle_tx,
+                        &activity_tx,
                         filter.as_ref(),
                         &mut pending_public,
                         &mut typed_command,
@@ -1348,7 +1377,7 @@ async fn run_idle_reaper(
         if !armed {
             match idle_rx.recv().await {
                 Some(IdleSignal::Idle) => armed = true,
-                Some(IdleSignal::Busy) => armed = false,
+                Some(IdleSignal::Busy) | Some(IdleSignal::Activity) => armed = false,
                 Some(IdleSignal::Stop) | None => return,
             }
             continue;
@@ -1356,7 +1385,7 @@ async fn run_idle_reaper(
 
         tokio::select! {
             signal = idle_rx.recv() => match signal {
-                Some(IdleSignal::Idle) => armed = true,
+                Some(IdleSignal::Idle) | Some(IdleSignal::Activity) => armed = true,
                 Some(IdleSignal::Busy) => armed = false,
                 Some(IdleSignal::Stop) | None => return,
             },
@@ -1398,6 +1427,7 @@ async fn apply_drain_control(
     closing: &ClosingState,
     question_keys: &Arc<StdRwLock<BTreeMap<String, Vec<Vec<String>>>>>,
     idle_tx: &mpsc::UnboundedSender<IdleSignal>,
+    activity_tx: &mpsc::Sender<()>,
     filter: &mut Option<RuntimeBusFilter>,
     pending_public: &mut VecDeque<super::events::Event>,
     typed_command: &mut Option<TypedCommandWaiter>,
@@ -1480,6 +1510,7 @@ async fn apply_drain_control(
                                 close_reason,
                                 question_keys,
                                 idle_tx,
+                                activity_tx,
                                 filter.as_ref(),
                                 pending_public,
                                 typed_command,
@@ -1512,6 +1543,7 @@ async fn process_internal_event(
     close_reason: &Arc<StdRwLock<Option<SmolStr>>>,
     question_keys: &Arc<StdRwLock<BTreeMap<String, Vec<Vec<String>>>>>,
     idle_tx: &mpsc::UnboundedSender<IdleSignal>,
+    activity_tx: &mpsc::Sender<()>,
     filter: Option<&RuntimeBusFilter>,
     pending_public: &mut VecDeque<super::events::Event>,
     typed_command: &mut Option<TypedCommandWaiter>,
@@ -1539,6 +1571,8 @@ async fn process_internal_event(
         }
     }
 
+    let _ = idle_tx.send(IdleSignal::Activity);
+    let _ = activity_tx.try_send(());
     let projection = Projector::project(capabilities, event);
 
     if let Some(session_id) = projection.session_id {

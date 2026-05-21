@@ -989,14 +989,19 @@ impl PiRpc {
             None
         };
 
-        self.extension_requests.insert(
-            id.to_string(),
-            ExtensionRequestKind {
-                id: id.to_string(),
-                method: ext_method,
-                question_id: question_id.clone(),
-            },
-        );
+        if matches!(
+            ext_method,
+            ExtensionMethod::Confirm | ExtensionMethod::Select
+        ) {
+            self.extension_requests.insert(
+                id.to_string(),
+                ExtensionRequestKind {
+                    id: id.to_string(),
+                    method: ext_method,
+                    question_id: question_id.clone(),
+                },
+            );
+        }
 
         match ext_method {
             ExtensionMethod::Confirm => {
@@ -2711,6 +2716,32 @@ mod tests {
         };
         let v: Value = serde_json::from_slice(bytes).unwrap();
         assert_eq!(v["value"], "B");
+    }
+
+    #[test]
+    fn set_status_extension_request_is_cancelled_without_permission_state() {
+        let mut d = setup();
+        let line = json!({
+            "type":"extension_ui_request",
+            "id":"status-1",
+            "method":"setStatus",
+            "statusKey":"sub-bar",
+            "statusText":""
+        });
+
+        let evs = d.translate(&serde_json::to_vec(&line).unwrap());
+
+        assert!(evs.is_empty());
+        assert!(d.extension_requests.is_empty());
+        let frames = d.drain_out_frames();
+        assert_eq!(frames.len(), 1);
+        let OutFrame::Stdin(ref bytes) = frames[0] else {
+            panic!("expected Stdin");
+        };
+        let v: Value = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(v["type"], "extension_ui_response");
+        assert_eq!(v["id"], "status-1");
+        assert_eq!(v["cancelled"], true);
     }
 
     #[test]

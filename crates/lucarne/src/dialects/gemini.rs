@@ -30,9 +30,9 @@ use crate::{
     },
     error::{LucarneError, Result},
     event::{
-        self, AttentionRequired, Event, LogLine, Payload, PermissionRequest, PermissionResponse,
-        ResumeHandle, Risk, SessionClosed, SessionStarted, Timeline, TimelineItem, ToolCall,
-        ToolResult, TurnCompleted, TurnFailed, Usage, UsageDelta,
+        self, Event, LogLine, Payload, PermissionRequest, PermissionResponse, ResumeHandle, Risk,
+        SessionClosed, SessionStarted, Timeline, TimelineItem, ToolCall, ToolResult, TurnCompleted,
+        TurnFailed, Usage, UsageDelta,
     },
 };
 use serde_json::{json, Map, Value};
@@ -771,18 +771,13 @@ impl Gemini {
                 options,
             },
         );
-        vec![
-            Event::new(Payload::AttentionRequired(AttentionRequired {
-                reason: "permission".into(),
-            })),
-            Event::new(Payload::PermissionRequest(PermissionRequest {
-                req_id,
-                tool,
-                input: Some(project_tool_call_update(&tool_call)),
-                risk: risk_for_tool_kind(&tool_kind),
-                questions: Vec::new(),
-            })),
-        ]
+        vec![Event::new(Payload::PermissionRequest(PermissionRequest {
+            req_id,
+            tool,
+            input: Some(project_tool_call_update(&tool_call)),
+            risk: risk_for_tool_kind(&tool_kind),
+            questions: Vec::new(),
+        }))]
     }
 
     fn translate_update(&mut self, update: &Value) -> Vec<Event> {

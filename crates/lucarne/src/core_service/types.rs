@@ -543,6 +543,12 @@ impl AgentSession for AgentSessionHandle {
         self.inner.take_events().await
     }
 
+    async fn take_activity_events(
+        &self,
+    ) -> Result<Option<crate::agent_runtime::AgentActivityStream>, AgentError> {
+        self.inner.take_activity_events().await
+    }
+
     async fn close(&self) -> Result<(), AgentError> {
         self.inner.close().await
     }
