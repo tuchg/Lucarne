@@ -34,7 +34,7 @@ class Lucarned < Formula
 
       system "cargo", "install", "--path", "crates/lucarned", "--root", prefix, "--no-track"
     else
-      bin.install "bin/lucarned"
+      bin.install "lucarned"
     end
   end
 
