@@ -72,7 +72,7 @@ impl Claude {
             }
 
             if cwd.is_none() {
-                if let Some(value) = raw.cwd {
+                if let Some(value) = raw.cwd.as_deref() {
                     cwd = Some(box_str(value));
                     if want_title {
                         if let Some(found) = extract_user_message_title(&raw) {
@@ -311,7 +311,7 @@ where
                         .and_then(|message| opt_box_str(message.id)),
                     role: map_role(raw.kind.unwrap_or("unknown")),
                     session_id: opt_box_str(raw.session_id),
-                    cwd: opt_box_str(raw.cwd),
+                    cwd: opt_cow_to_box(raw.cwd.clone()),
                     model: raw
                         .message
                         .as_ref()
@@ -356,7 +356,7 @@ where
                             .and_then(|value| opt_box_str(value.attachment_type)),
                         name: attachment
                             .as_ref()
-                            .and_then(|value| opt_box_str(value.name)),
+                            .and_then(|value| opt_cow_to_box(value.name.clone())),
                         species: attachment
                             .as_ref()
                             .and_then(|value| opt_box_str(value.species)),
@@ -390,7 +390,7 @@ where
                 if selection.includes_state() {
                     entries.push(Entry::LastPrompt(LastPromptEntry {
                         session_id: opt_box_str(raw.session_id),
-                        last_prompt: opt_box_str(raw.last_prompt),
+                        last_prompt: raw.last_prompt.map(cow_to_box),
                     }));
                 }
             }
@@ -405,19 +405,20 @@ where
                     Some("hook_progress") => {
                         entries.push(Entry::Progress(ProgressEntry::HookProgress {
                             session_id: opt_box_str(raw.session_id),
-                            cwd: opt_box_str(raw.cwd),
+                            cwd: opt_cow_to_box(raw.cwd.clone()),
                             timestamp: opt_timestamp_box_str(raw.timestamp.as_ref()),
                             parent_tool_use_id: opt_box_str(raw.parent_tool_use_id),
                             tool_use_id: opt_box_str(raw.tool_use_id),
                             hook_event: progress.and_then(|value| opt_box_str(value.hook_event)),
                             hook_name: progress.and_then(|value| opt_box_str(value.hook_name)),
-                            command: progress.and_then(|value| opt_box_str(value.command)),
+                            command: progress
+                                .and_then(|value| opt_cow_to_box(value.command.clone())),
                         }))
                     }
                     Some("bash_progress") => {
                         entries.push(Entry::Progress(ProgressEntry::BashProgress {
                             session_id: opt_box_str(raw.session_id),
-                            cwd: opt_box_str(raw.cwd),
+                            cwd: opt_cow_to_box(raw.cwd.clone()),
                             timestamp: opt_timestamp_box_str(raw.timestamp.as_ref()),
                             parent_tool_use_id: opt_box_str(raw.parent_tool_use_id),
                             tool_use_id: opt_box_str(raw.tool_use_id),
@@ -432,7 +433,7 @@ where
                     Some("agent_progress") => {
                         entries.push(Entry::Progress(ProgressEntry::AgentProgress {
                             session_id: opt_box_str(raw.session_id),
-                            cwd: opt_box_str(raw.cwd),
+                            cwd: opt_cow_to_box(raw.cwd.clone()),
                             timestamp: opt_timestamp_box_str(raw.timestamp.as_ref()),
                             parent_tool_use_id: opt_box_str(raw.parent_tool_use_id),
                             tool_use_id: opt_box_str(raw.tool_use_id),
@@ -444,7 +445,7 @@ where
                     Some("query_update") => {
                         entries.push(Entry::Progress(ProgressEntry::QueryUpdate {
                             session_id: opt_box_str(raw.session_id),
-                            cwd: opt_box_str(raw.cwd),
+                            cwd: opt_cow_to_box(raw.cwd.clone()),
                             timestamp: opt_timestamp_box_str(raw.timestamp.as_ref()),
                             parent_tool_use_id: opt_box_str(raw.parent_tool_use_id),
                             tool_use_id: opt_box_str(raw.tool_use_id),
@@ -454,7 +455,7 @@ where
                     Some("search_results_received") => {
                         entries.push(Entry::Progress(ProgressEntry::SearchResultsReceived {
                             session_id: opt_box_str(raw.session_id),
-                            cwd: opt_box_str(raw.cwd),
+                            cwd: opt_cow_to_box(raw.cwd.clone()),
                             timestamp: opt_timestamp_box_str(raw.timestamp.as_ref()),
                             parent_tool_use_id: opt_box_str(raw.parent_tool_use_id),
                             tool_use_id: opt_box_str(raw.tool_use_id),
@@ -465,7 +466,7 @@ where
                     Some("mcp_progress") => {
                         entries.push(Entry::Progress(ProgressEntry::McpProgress {
                             session_id: opt_box_str(raw.session_id),
-                            cwd: opt_box_str(raw.cwd),
+                            cwd: opt_cow_to_box(raw.cwd.clone()),
                             timestamp: opt_timestamp_box_str(raw.timestamp.as_ref()),
                             parent_tool_use_id: opt_box_str(raw.parent_tool_use_id),
                             tool_use_id: opt_box_str(raw.tool_use_id),
@@ -477,19 +478,19 @@ where
                     Some("waiting_for_task") => {
                         entries.push(Entry::Progress(ProgressEntry::WaitingForTask {
                             session_id: opt_box_str(raw.session_id),
-                            cwd: opt_box_str(raw.cwd),
+                            cwd: opt_cow_to_box(raw.cwd.clone()),
                             timestamp: opt_timestamp_box_str(raw.timestamp.as_ref()),
                             parent_tool_use_id: opt_box_str(raw.parent_tool_use_id),
                             tool_use_id: opt_box_str(raw.tool_use_id),
                             task_description: progress
-                                .and_then(|value| opt_box_str(value.task_description)),
+                                .and_then(|value| opt_cow_to_box(value.task_description.clone())),
                             task_type: progress.and_then(|value| opt_box_str(value.task_type)),
                         }))
                     }
                     _ => entries.push(Entry::Progress(ProgressEntry::Other {
                         kind: progress_kind.map(box_str),
                         session_id: opt_box_str(raw.session_id),
-                        cwd: opt_box_str(raw.cwd),
+                        cwd: opt_cow_to_box(raw.cwd.clone()),
                         timestamp: opt_timestamp_box_str(raw.timestamp.as_ref()),
                         parent_tool_use_id: opt_box_str(raw.parent_tool_use_id),
                         tool_use_id: opt_box_str(raw.tool_use_id),
@@ -526,7 +527,7 @@ where
                     entries.push(Entry::InputSnapshot(InputSnapshotEntry {
                         display: raw.display.map(cow_to_box),
                         pasted_contents_json: opt_raw_json_box(raw.pasted_contents),
-                        project: opt_box_str(raw.project),
+                        project: raw.project.map(cow_to_box),
                         session_id: opt_box_str(raw.session_id),
                         timestamp_millis: opt_timestamp_millis(raw.timestamp.as_ref()),
                     }));
@@ -592,7 +593,7 @@ where
             };
         }
         if cwd.is_none() && raw.cwd.is_some() {
-            cwd = opt_box_str(raw.cwd);
+            cwd = opt_cow_to_box(raw.cwd.clone());
             if timestamp.is_none() {
                 timestamp = opt_timestamp_box_str(raw.timestamp.as_ref());
             }
@@ -715,8 +716,8 @@ struct RawEntry<'a> {
     kind: Option<&'a str>,
     #[serde(default, alias = "sessionId")]
     session_id: Option<&'a str>,
-    #[serde(default)]
-    cwd: Option<&'a str>,
+    #[serde(default, borrow)]
+    cwd: Option<Cow<'a, str>>,
     #[serde(default, alias = "isMeta")]
     is_meta: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_timestamp")]
@@ -738,7 +739,7 @@ struct RawEntry<'a> {
     #[serde(default)]
     snapshot: Option<SnapshotPayload<'a>>,
     #[serde(default, alias = "lastPrompt")]
-    last_prompt: Option<&'a str>,
+    last_prompt: Option<Cow<'a, str>>,
     #[serde(default)]
     operation: Option<&'a str>,
     #[serde(default, borrow)]
@@ -748,7 +749,7 @@ struct RawEntry<'a> {
     #[serde(default, alias = "pastedContents", borrow)]
     pasted_contents: Option<&'a RawValue>,
     #[serde(default)]
-    project: Option<&'a str>,
+    project: Option<Cow<'a, str>>,
     #[serde(default)]
     subtype: Option<&'a str>,
     #[serde(default)]
@@ -981,7 +982,7 @@ struct AttachmentPayload<'a> {
     #[serde(default)]
     attachment_type: Option<&'a str>,
     #[serde(default)]
-    name: Option<&'a str>,
+    name: Option<Cow<'a, str>>,
     #[serde(default)]
     species: Option<&'a str>,
 }
@@ -1003,7 +1004,7 @@ struct ProgressPayload<'a> {
     #[serde(default)]
     hook_name: Option<&'a str>,
     #[serde(default)]
-    command: Option<&'a str>,
+    command: Option<Cow<'a, str>>,
     #[serde(default)]
     output: Option<Cow<'a, str>>,
     #[serde(default, alias = "fullOutput")]
@@ -1029,7 +1030,7 @@ struct ProgressPayload<'a> {
     #[serde(default, alias = "toolName")]
     tool_name: Option<&'a str>,
     #[serde(default, alias = "taskDescription")]
-    task_description: Option<&'a str>,
+    task_description: Option<Cow<'a, str>>,
     #[serde(default, alias = "taskType")]
     task_type: Option<&'a str>,
 }
@@ -1092,6 +1093,69 @@ mod tests {
             panic!("meta-only reader parse should return one progress meta entry");
         };
         assert_eq!(session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn reader_accepts_escaped_windows_cwd() {
+        let bytes = concat!(
+            r#"{"type":"user","sessionId":"sess-win","cwd":"D:\\Input\\Api\\src\\InputService","timestamp":"2026-05-01T11:09:46.305Z","message":{"id":"msg-win","model":"claude-sonnet-4","content":"hello from windows"}}"#,
+            "\n",
+        );
+
+        let (_version, body) = super::parse_claude_reader(
+            Cursor::new(bytes.as_bytes()),
+            crate::ParseSelection::full(),
+        )
+        .unwrap();
+
+        let [super::Entry::Message(message)] = body.entries.as_ref() else {
+            panic!("expected one message entry");
+        };
+        assert_eq!(message.session_id.as_deref(), Some("sess-win"));
+        assert_eq!(
+            message.cwd.as_deref(),
+            Some(r#"D:\Input\Api\src\InputService"#)
+        );
+    }
+
+    #[test]
+    fn reader_accepts_escaped_windows_progress_command() {
+        let bytes = concat!(
+            r#"{"type":"progress","sessionId":"sess-win","cwd":"D:\\Input","timestamp":"2026-05-01T11:09:46.305Z","data":{"type":"hook_progress","command":"cd D:\\Input\\Api\nrun tests"}}"#,
+            "\n",
+        );
+
+        let (_version, body) = super::parse_claude_reader(
+            Cursor::new(bytes.as_bytes()),
+            crate::ParseSelection::full(),
+        )
+        .unwrap();
+
+        let [super::Entry::Progress(super::ProgressEntry::HookProgress { command, .. })] =
+            body.entries.as_ref()
+        else {
+            panic!("expected hook progress entry");
+        };
+        assert_eq!(command.as_deref(), Some("cd D:\\Input\\Api\nrun tests"));
+    }
+
+    #[cfg(feature = "agent_session")]
+    #[test]
+    fn probe_session_meta_accepts_escaped_windows_cwd() {
+        let bytes = concat!(
+            r#"{"type":"user","sessionId":"sess-win","cwd":"D:\\Input\\Api\\src\\InputService","timestamp":"2026-05-01T11:09:46.305Z"}"#,
+            "\n",
+        );
+
+        let meta = super::Claude::probe_session_meta(Cursor::new(bytes.as_bytes()))
+            .unwrap()
+            .expect("expected session meta");
+
+        assert_eq!(meta.session_id.as_deref(), Some("sess-win"));
+        assert_eq!(
+            meta.cwd.as_deref(),
+            Some(r#"D:\Input\Api\src\InputService"#)
+        );
     }
 
     #[cfg(feature = "agent_session")]

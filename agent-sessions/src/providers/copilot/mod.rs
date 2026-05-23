@@ -98,19 +98,19 @@ fn parse_chat_session_str(text: &str, selection: ParseSelection) -> Result<ChatS
         raw.requests
             .into_iter()
             .map(|request| ChatRequest {
-                request_id: box_str(request.request_id),
+                request_id: cow_to_box(request.request_id),
                 prompt: request.message.and_then(|message| {
-                    if !message.text.is_empty() {
-                        Some(box_str(message.text))
+                    if let Some(text) = message.text.filter(|text| !text.is_empty()) {
+                        Some(cow_to_box(text))
                     } else {
                         message
                             .parts
                             .into_iter()
-                            .find_map(|part| part.text.map(box_str))
+                            .find_map(|part| part.text.map(cow_to_box))
                     }
                 }),
                 timestamp: request.timestamp,
-                model_id: request.model_id.map(box_str),
+                model_id: request.model_id.map(cow_to_box),
                 response: request
                     .response
                     .into_iter()
@@ -127,8 +127,8 @@ fn parse_chat_session_str(text: &str, selection: ParseSelection) -> Result<ChatS
     };
 
     Ok(ChatSessionBody {
-        session_id: raw.session_id.map(box_str),
-        workspace_id: raw.workspace_id.map(box_str),
+        session_id: raw.session_id.map(cow_to_box),
+        workspace_id: raw.workspace_id.map(cow_to_box),
         model: raw
             .selected_model
             .and_then(|model| model.identifier.map(box_str)),
@@ -140,8 +140,8 @@ fn parse_chat_session_str(text: &str, selection: ParseSelection) -> Result<ChatS
 fn parse_chat_session_meta_str(text: &str) -> Result<ChatSessionBody> {
     let raw: RawChatSessionMeta<'_> = serde_json::from_str(text)?;
     Ok(ChatSessionBody {
-        session_id: raw.session_id.map(box_str),
-        workspace_id: raw.workspace_id.map(box_str),
+        session_id: raw.session_id.map(cow_to_box),
+        workspace_id: raw.workspace_id.map(cow_to_box),
         model: raw
             .selected_model
             .and_then(|model| model.identifier.map(box_str)),
@@ -563,14 +563,14 @@ fn extract_response_text(raw: Option<&RawValue>) -> Option<SmolStr> {
 #[serde(rename_all = "camelCase")]
 struct RawChatSession<'a> {
     #[serde(default)]
-    session_id: Option<&'a str>,
+    session_id: Option<Cow<'a, str>>,
     #[serde(default)]
-    workspace_id: Option<&'a str>,
+    workspace_id: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
     requests: Vec<RawChatRequest<'a>>,
-    #[serde(default)]
+    #[serde(default, borrow)]
     mode: Option<RawMode<'a>>,
-    #[serde(default)]
+    #[serde(default, borrow)]
     selected_model: Option<RawSelectedModel<'a>>,
 }
 
@@ -578,12 +578,12 @@ struct RawChatSession<'a> {
 #[serde(rename_all = "camelCase")]
 struct RawChatSessionMeta<'a> {
     #[serde(default)]
-    session_id: Option<&'a str>,
+    session_id: Option<Cow<'a, str>>,
     #[serde(default)]
-    workspace_id: Option<&'a str>,
-    #[serde(default)]
+    workspace_id: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
     mode: Option<RawMode<'a>>,
-    #[serde(default)]
+    #[serde(default, borrow)]
     selected_model: Option<RawSelectedModel<'a>>,
 }
 
@@ -597,7 +597,7 @@ struct RawChatSessionProbe<'a> {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawChatRequest<'a> {
-    request_id: &'a str,
+    request_id: Cow<'a, str>,
     #[serde(default, borrow)]
     message: Option<RawChatMessage<'a>>,
     #[serde(default, borrow)]
@@ -605,13 +605,13 @@ struct RawChatRequest<'a> {
     #[serde(default)]
     timestamp: Option<i64>,
     #[serde(default)]
-    model_id: Option<&'a str>,
+    model_id: Option<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]
 struct RawChatMessage<'a> {
     #[serde(default)]
-    text: &'a str,
+    text: Option<Cow<'a, str>>,
     #[serde(default, borrow)]
     parts: Vec<RawMessagePart<'a>>,
 }
@@ -619,7 +619,7 @@ struct RawChatMessage<'a> {
 #[derive(Deserialize)]
 struct RawMessagePart<'a> {
     #[serde(default)]
-    text: Option<&'a str>,
+    text: Option<Cow<'a, str>>,
 }
 
 #[derive(Deserialize)]
@@ -922,6 +922,36 @@ mod tests {
             panic!("expected copilot chat-session body");
         };
         assert!(!from_reader.requests.is_empty());
+    }
+
+    #[test]
+    fn chat_session_reader_accepts_escaped_windows_workspace_and_prompt() {
+        let bytes = concat!(
+            r#"{"sessionId":"sess-chat","workspaceId":"C:\\Users\\alice\\project","requests":[{"requestId":"req-1","message":{"text":"open C:\\Users\\alice\\project\nthen inspect"},"response":[]}]}"#,
+            "\n",
+        );
+
+        let (_version, body) = super::parse_copilot_body_reader(
+            Cursor::new(bytes.as_bytes()),
+            crate::InputMetadata::default(),
+            crate::ParseSelection::full(),
+        )
+        .unwrap();
+
+        let super::Body::ChatSession(body) = body else {
+            panic!("expected chat session body");
+        };
+        assert_eq!(
+            body.workspace_id.as_deref(),
+            Some(r#"C:\Users\alice\project"#)
+        );
+        let [request] = body.requests.as_ref() else {
+            panic!("expected one request");
+        };
+        assert_eq!(
+            request.prompt.as_deref(),
+            Some("open C:\\Users\\alice\\project\nthen inspect")
+        );
     }
 
     #[cfg(feature = "agent_session")]

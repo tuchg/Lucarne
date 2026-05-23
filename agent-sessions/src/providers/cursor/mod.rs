@@ -245,6 +245,32 @@ mod tests {
         assert!(body.entries.is_empty());
     }
 
+    #[test]
+    fn reader_accepts_escaped_windows_message_text() {
+        let bytes = concat!(
+            r#"{"role":"user","timestamp":"2026-05-01T11:09:46.305Z","message":{"content":"open C:\\Users\\alice\\project\nthen inspect"}}"#,
+            "\n",
+        );
+
+        let body = super::parse_cursor_reader(
+            IoCursor::new(bytes.as_bytes()),
+            Some("cursor-win".into()),
+            crate::ParseSelection::full(),
+        )
+        .unwrap();
+
+        let [entry] = body.entries.as_ref() else {
+            panic!("expected one cursor entry");
+        };
+        let [super::ContentBlock::Text(text)] = entry.blocks.as_ref() else {
+            panic!("expected one text block");
+        };
+        assert_eq!(
+            text.text.as_str(),
+            "open C:\\Users\\alice\\project\nthen inspect"
+        );
+    }
+
     #[cfg(feature = "agent_session")]
     #[test]
     fn direct_agent_session_reader_parses_current_fixture() {

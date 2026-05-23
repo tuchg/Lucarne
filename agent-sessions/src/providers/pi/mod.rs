@@ -625,6 +625,32 @@ mod tests {
     }
 
     #[test]
+    fn reader_accepts_escaped_windows_cwd_and_message_text() {
+        let bytes = concat!(
+            r#"{"type":"session","version":3,"id":"pi-win","timestamp":"2026-05-03T00:00:00.000Z","cwd":"C:\\Users\\alice\\project"}"#,
+            "\n",
+            r#"{"type":"message","id":"u1","timestamp":"2026-05-03T00:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"open C:\\Users\\alice\\project\nthen inspect"}]}}"#,
+            "\n",
+        );
+
+        let body =
+            super::parse_pi_reader(Cursor::new(bytes), crate::ParseSelection::full()).unwrap();
+
+        let [
+            super::Entry::SessionInfo { cwd, .. },
+            super::Entry::UserMessage { text, .. },
+        ] = body.entries.as_ref()
+        else {
+            panic!("expected session info and user message");
+        };
+        assert_eq!(cwd.as_deref(), Some(r#"C:\Users\alice\project"#));
+        assert_eq!(
+            text.as_str(),
+            "open C:\\Users\\alice\\project\nthen inspect"
+        );
+    }
+
+    #[test]
     fn probe_session_meta_uses_first_post_parent_session_user_text_as_title() {
         let mut lines = vec![
             r#"{"type":"session","version":3,"id":"child","timestamp":"2026-05-11T00:49:47.936Z","cwd":"/tmp/project","parentSession":"/tmp/parent.jsonl"}"#,

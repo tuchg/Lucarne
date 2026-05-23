@@ -447,6 +447,32 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn reader_accepts_escaped_windows_message_text() {
+        let bytes = concat!(
+            r#"{"sessionId":"gem-win","messages":[{"type":"user","id":"u1","timestamp":"2026-05-01T11:09:46.305Z","content":"open C:\\Users\\alice\\project\nthen inspect"}]}"#,
+            "\n",
+        );
+
+        let body = super::parse_gemini_body_reader(
+            Cursor::new(bytes.as_bytes()),
+            Some(r#"C:\Users\alice\project"#.into()),
+            crate::ParseSelection::full(),
+        )
+        .unwrap();
+
+        let [super::Entry::User(message)] = body.entries.as_ref() else {
+            panic!("expected one user entry");
+        };
+        let [super::UserContentPart::Text(text)] = message.content.as_ref() else {
+            panic!("expected one text part");
+        };
+        assert_eq!(
+            text.text.as_str(),
+            "open C:\\Users\\alice\\project\nthen inspect"
+        );
+    }
+
+    #[test]
     fn direct_agent_session_reader_parses_current_fixture() {
         let bytes = include_bytes!("../../../tests/fixtures/gemini/session-sample.json").as_slice();
         let metadata = crate::InputMetadata::new().name("gemini-session.json");
