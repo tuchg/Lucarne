@@ -8,7 +8,9 @@ use lucarne::agent_runtime::{
     AgentCapabilities, AgentError, AgentErrorKind, AgentProvider, AgentRuntime, OpenSession,
     ProbeResult, ProviderId, ResumeSession,
 };
-use lucarne::agent_runtime::{AgentForkTargetCatalog, AgentImageInput, AgentStatus, InstanceId};
+use lucarne::agent_runtime::{
+    AgentForkTargetCatalog, AgentImageInput, AgentInput, AgentStatus, InstanceId,
+};
 #[cfg(test)]
 use lucarne::control_plane::ControlPlaneSqliteStore;
 use lucarne::control_plane::{
@@ -21,7 +23,7 @@ use lucarne::control_plane::{
     WorkspaceId as ControlWorkspaceId,
 };
 use lucarne::core_service::{
-    CoreWorkspaceEventStream, DaemonSession, LucarneCore, OpenWorkspaceRequest,
+    CoreWorkspaceEventStream, DaemonSession, LucarneCore, OpenWorkspaceRequest, SubmitTurnRequest,
     TimelineKindProjection, TimelineProjectionItem,
 };
 use lucarne::event::SubAgentCall;
@@ -290,6 +292,32 @@ impl BotState {
             chat,
             &WorkspaceId::new(topic_id.as_str()),
         ));
+    }
+
+    pub fn core_handle(&self) -> Arc<LucarneCore> {
+        Arc::clone(&self.core)
+    }
+
+    pub async fn submit_user_turn(
+        &self,
+        ws: &WorkspaceId,
+        input: AgentInput,
+        reply_to: Option<&MessageId>,
+    ) -> Result<RunningTurn, String> {
+        let submitted = self
+            .core
+            .submit_turn(SubmitTurnRequest {
+                workspace_id: control_workspace_id(ws),
+                source: TurnSource::UserMessage,
+                input,
+                reply_to_channel_message_id: reply_to
+                    .and_then(|id| id.as_str().parse::<i64>().ok()),
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(RunningTurn {
+            turn_id: submitted.turn_id,
+        })
     }
 
     fn sync_core_session(
@@ -1691,6 +1719,7 @@ impl BotState {
         )
     }
 
+    #[cfg(test)]
     pub fn start_user_turn(
         &self,
         ws: &WorkspaceId,

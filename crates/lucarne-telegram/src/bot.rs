@@ -64,7 +64,10 @@ use tracing::{debug, info, instrument, warn};
 use crate::{
     agents,
     channel::TelegramBotCommand,
-    state::{BotState, LiveSession, PanelSnapshot, PanelView, RunningCommandWorkflow, WorkSession},
+    state::{
+        BotState, LiveSession, PanelSnapshot, PanelView, RunningCommandWorkflow, RunningTurn,
+        WorkSession,
+    },
     turn,
 };
 use base64::Engine;
@@ -1635,6 +1638,48 @@ impl Bot {
         Ok(())
     }
 
+    async fn submit_and_drain_user_turn(
+        &self,
+        ws: &WorkspaceId,
+        handle: &WorkspaceHandle,
+        live: &LiveSession,
+        input: AgentInput,
+        provider_id: &str,
+        recorder: Arc<dyn turn::TurnEventRecorder>,
+        intervention_callback_registry: Option<Arc<dyn turn::AgentInterventionCallbackRegistry>>,
+        final_footer: Option<AgentMessageFooter>,
+        source_message: &MessageId,
+        reply_to: Option<MessageId>,
+    ) -> Result<(RunningTurn, turn::TurnRunReport), String> {
+        turn::prepare_turn_drain(live).await;
+        let _direct_notification_guard =
+            DirectNotificationGuard::new(self.state.core_handle(), ws.clone());
+        let running_turn = self
+            .state
+            .submit_user_turn(ws, input, Some(source_message))
+            .await
+            .map_err(|err| err.to_string())?;
+        debug!("prompt submitted");
+        let report = turn::drain_turn_with_options(
+            &self.channel,
+            handle,
+            live,
+            provider_id,
+            turn::TurnRunOptions {
+                recording: Some(turn::TurnRecording {
+                    turn_id: running_turn.turn_id.clone(),
+                    recorder,
+                }),
+                intervention_callback_registry,
+                final_footer,
+            },
+            reply_to,
+        )
+        .await?;
+        self.state.complete_turn(&running_turn)?;
+        Ok((running_turn, report))
+    }
+
     async fn run_workspace_turn(
         &self,
         ws: &WorkspaceId,
@@ -1715,35 +1760,23 @@ impl Bot {
         let recorder = recorder_scope.recorder(&self.state);
         let intervention_callback_registry =
             recorder_scope.intervention_callback_registry(&self.state);
-        let mut running_turn =
-            self.state
-                .start_user_turn(ws, &live, input.text.as_ref(), Some(source_message))?;
-        let _direct_notification_guard =
-            DirectNotificationGuard::new(Arc::clone(&self.core), ws.clone());
-        let report = match turn::run_turn_with_options(
-            &self.channel,
-            handle,
-            &live,
-            input.clone(),
-            session.provider_id,
-            turn::TurnRunOptions {
-                recording: Some(turn::TurnRecording {
-                    turn_id: running_turn.turn_id.clone(),
-                    recorder: Arc::clone(&recorder),
-                }),
-                intervention_callback_registry: intervention_callback_registry.clone(),
-                final_footer: final_footer.clone(),
-            },
-            reply_to.clone(),
-        )
-        .await
+        let (running_turn, report) = match self
+            .submit_and_drain_user_turn(
+                ws,
+                handle,
+                &live,
+                input.clone(),
+                session.provider_id,
+                Arc::clone(&recorder),
+                intervention_callback_registry.clone(),
+                final_footer.clone(),
+                source_message,
+                reply_to.clone(),
+            )
+            .await
         {
-            Ok(report) => {
-                self.state.complete_turn(&running_turn)?;
-                report
-            }
+            Ok((running_turn, report)) => (running_turn, report),
             Err(err) if is_recoverable_live_session_error(&err) => {
-                self.state.fail_turn(&running_turn, &err)?;
                 warn!(
                     target: "lucarne_telegram::bot",
                     error = %err,
@@ -1773,44 +1806,24 @@ impl Bot {
                 let retry_live = self
                     .ensure_live_bound(&mut retry_session, force_bypass_permissions)
                     .await?;
-                running_turn = self.state.start_user_turn(
-                    ws,
-                    &retry_live,
-                    input.text.as_ref(),
-                    Some(source_message),
-                )?;
-                let retry_report = match turn::run_turn_with_options(
-                    &self.channel,
-                    handle,
-                    &retry_live,
-                    input,
-                    session.provider_id,
-                    turn::TurnRunOptions {
-                        recording: Some(turn::TurnRecording {
-                            turn_id: running_turn.turn_id.clone(),
-                            recorder,
-                        }),
+                let retry_result = self
+                    .submit_and_drain_user_turn(
+                        ws,
+                        handle,
+                        &retry_live,
+                        input,
+                        session.provider_id,
+                        recorder,
                         intervention_callback_registry,
                         final_footer,
-                    },
-                    reply_to,
-                )
-                .await
-                {
-                    Ok(retry_report) => {
-                        self.state.complete_turn(&running_turn)?;
-                        retry_report
-                    }
-                    Err(retry_err) => {
-                        self.state.fail_turn(&running_turn, &retry_err)?;
-                        return Err(retry_err);
-                    }
-                };
+                        source_message,
+                        reply_to,
+                    )
+                    .await?;
                 live = retry_live;
-                retry_report
+                retry_result
             }
             Err(err) => {
-                self.state.fail_turn(&running_turn, &err)?;
                 let resume_ref = match session.resume_ref.clone() {
                     Some(resume_ref) => Some(resume_ref),
                     None => live_provider_resume_ref(&live).await,
@@ -3135,7 +3148,40 @@ impl Bot {
             let observed_close = live.session.observed_close_reason().await;
             if observed_close.is_none() {
                 let provider_ref_after = live_provider_resume_ref(&live).await;
-                if let (Some(expected_ref), Some(live_ref)) =
+                let core_workspace_id =
+                    lucarne::control_plane::WorkspaceId::new(session.workspace.as_str());
+                let core_live_instance_id = lucarne::control_plane::LiveInstanceId::new(
+                    live.session.instance_id().0.as_str(),
+                );
+                if !self
+                    .core
+                    .live_session_is_bound(&core_workspace_id, &core_live_instance_id)
+                {
+                    let resume_ref = match session.resume_ref.clone() {
+                        Some(resume_ref) => Some(resume_ref),
+                        None if self.should_keep_live_only_resume_ref(
+                            &session.workspace,
+                            None,
+                            provider_ref_after.as_deref(),
+                        ) =>
+                        {
+                            None
+                        }
+                        None => provider_ref_after.clone(),
+                    };
+                    warn!(
+                        target: "lucarne_telegram::bot",
+                        provider = session.provider_id,
+                        workspace = %session.workspace.as_str(),
+                        live_instance = %core_live_instance_id.as_str(),
+                        "discarding live session missing from core runtime registry before turn"
+                    );
+                    self.state
+                        .mark_live_dead(&session.workspace, resume_ref.clone())
+                        .map_err(|e| e.to_string())?;
+                    session.resume_ref = resume_ref;
+                    session.live = None;
+                } else if let (Some(expected_ref), Some(live_ref)) =
                     (session.resume_ref.clone(), provider_ref_after.clone())
                 {
                     if expected_ref != live_ref {
@@ -3216,9 +3262,17 @@ impl Bot {
                 return Err(err);
             }
         };
-        let resume_ref = live_provider_resume_ref(&live)
-            .await
-            .or_else(|| session.resume_ref.clone());
+        let provider_ref_after = live_provider_resume_ref(&live).await;
+        let keep_live_only = self.should_keep_live_only_resume_ref(
+            &session.workspace,
+            session.resume_ref.as_deref(),
+            provider_ref_after.as_deref(),
+        );
+        let resume_ref = if keep_live_only {
+            None
+        } else {
+            provider_ref_after.or_else(|| session.resume_ref.clone())
+        };
         self.state
             .bind_live(&session.workspace, live.clone(), resume_ref.clone())
             .map_err(|e| e.to_string())?;
@@ -7089,7 +7143,7 @@ mod tests {
     }
 
     fn test_bot_with_state(channel: Arc<RecordingChannel>, state: Arc<BotState>) -> Arc<Bot> {
-        let core = core_with_runtime(Arc::new(AgentRuntime::new()));
+        let core = state.core_handle();
         Arc::new(Bot::new_with_state(
             channel,
             core,
@@ -7535,12 +7589,11 @@ mod tests {
         std::fs::create_dir_all(&project).expect("project dir");
         std::fs::write(project.join("README.md"), "lucarne telegram live bot e2e\n")
             .expect("readme");
-        let db = temp.path().join("state.sqlite3");
         let channel = Arc::new(RecordingChannel::default());
         let runtime = Arc::new(AgentRuntime::new());
         runtime.register_defaults();
         let core = core_with_runtime(runtime);
-        let state = BotState::open_sqlite(&db).expect("open temp state");
+        let state = BotState::new_with_core(Arc::clone(&core));
         let bot = Arc::new(Bot::new_with_state(
             channel.clone(),
             core,
@@ -7607,9 +7660,8 @@ mod tests {
             ProtocolProvider::new(active_provider.adapter()).expect("recorded provider"),
         ));
         let core = core_with_runtime(Arc::new(runtime));
-        let db = temp.path().join("state.sqlite3");
         let channel = Arc::new(RecordingChannel::default());
-        let state = BotState::open_sqlite(&db).expect("open temp state");
+        let state = BotState::new_with_core(Arc::clone(&core));
         let bot = Arc::new(Bot::new_with_state(
             channel.clone(),
             core,
@@ -7712,12 +7764,11 @@ mod tests {
             ("LUCARNE_TELEGRAM_LIVE_TIMEOUT", OsString::from("5")),
         ]);
 
-        let db = temp.path().join("state.sqlite3");
         let channel = Arc::new(RecordingChannel::default());
         let runtime = Arc::new(AgentRuntime::new());
         runtime.register_defaults();
         let core = core_with_runtime(runtime);
-        let state = BotState::open_sqlite(&db).expect("open temp state");
+        let state = BotState::new_with_core(Arc::clone(&core));
         let bot = Arc::new(Bot::new_with_state(
             channel.clone(),
             core,

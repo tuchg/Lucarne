@@ -1,12 +1,12 @@
 use super::types::WorkspaceId;
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock},
+    collections::{HashMap, VecDeque},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex as StdMutex, RwLock as StdRwLock,
+    },
 };
-use tokio::{
-    sync::{Mutex as AsyncMutex, OwnedMutexGuard},
-    task::JoinHandle,
-};
+use tokio::sync::oneshot;
 use tracing::debug;
 
 #[derive(Debug)]
@@ -36,7 +36,8 @@ pub struct QueuedTurn {
     workspace_id: WorkspaceId,
     position: usize,
     scheduler: TurnScheduler,
-    waiter: Option<JoinHandle<OwnedMutexGuard<()>>>,
+    waiter: Option<Arc<QueuedWaiter>>,
+    receiver: Option<oneshot::Receiver<()>>,
     counted: bool,
 }
 
@@ -46,17 +47,18 @@ impl QueuedTurn {
     }
 
     pub async fn wait(mut self) -> TurnPermit {
-        let guard = self
-            .waiter
+        self.receiver
             .take()
-            .expect("queued turn waiter")
+            .expect("queued turn receiver")
             .await
-            .expect("queued turn waiter task");
-        self.scheduler.note_dequeued(&self.workspace_id);
+            .expect("queued turn grant");
+        self.scheduler.note_handoff_started(&self.workspace_id);
         self.counted = false;
+        self.waiter = None;
         TurnPermit {
             queued_position: Some(self.position),
-            _guard: guard,
+            workspace_id: self.workspace_id.clone(),
+            scheduler: self.scheduler.clone(),
         }
     }
 }
@@ -65,9 +67,15 @@ impl Drop for QueuedTurn {
     fn drop(&mut self) {
         if self.counted {
             if let Some(waiter) = self.waiter.take() {
-                waiter.abort();
+                waiter.cancel();
+                match self.scheduler.cancel_queued(&self.workspace_id, waiter.id) {
+                    CancelOutcome::Removed => {}
+                    CancelOutcome::PendingHandoff => {
+                        self.scheduler.release_next(&self.workspace_id);
+                    }
+                    CancelOutcome::Missing => {}
+                }
             }
-            self.scheduler.note_dequeued(&self.workspace_id);
         }
     }
 }
@@ -75,7 +83,8 @@ impl Drop for QueuedTurn {
 #[derive(Debug)]
 pub struct TurnPermit {
     queued_position: Option<usize>,
-    _guard: OwnedMutexGuard<()>,
+    workspace_id: WorkspaceId,
+    scheduler: TurnScheduler,
 }
 
 impl TurnPermit {
@@ -84,10 +93,16 @@ impl TurnPermit {
     }
 }
 
+impl Drop for TurnPermit {
+    fn drop(&mut self) {
+        self.scheduler.release_next(&self.workspace_id);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TurnScheduler {
-    locks: Arc<StdRwLock<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>,
-    waiters: Arc<StdMutex<HashMap<WorkspaceId, usize>>>,
+    queues: Arc<StdRwLock<HashMap<WorkspaceId, Arc<StdMutex<WorkspaceQueue>>>>>,
+    next_waiter_id: Arc<AtomicU64>,
 }
 
 impl TurnScheduler {
@@ -96,81 +111,173 @@ impl TurnScheduler {
     }
 
     pub fn admit(&self, workspace_id: &WorkspaceId) -> TurnAdmission {
-        let lock = self.workspace_lock(workspace_id);
-        match lock.clone().try_lock_owned() {
-            Ok(guard) => {
-                debug!(
-                    target: "lucarne::control_plane::turn_queue",
-                    workspace_id = %workspace_id.as_str(),
-                    "turn admitted"
-                );
-                TurnAdmission::Ready(TurnPermit {
-                    queued_position: None,
-                    _guard: guard,
-                })
-            }
-            Err(_) => {
-                let position = self.note_queued(workspace_id);
-                debug!(
-                    target: "lucarne::control_plane::turn_queue",
-                    workspace_id = %workspace_id.as_str(),
-                    position,
-                    "turn queued"
-                );
-                let waiter = tokio::spawn(async move { lock.lock_owned().await });
-                TurnAdmission::Queued(QueuedTurn {
-                    workspace_id: workspace_id.clone(),
-                    position,
-                    scheduler: self.clone(),
-                    waiter: Some(waiter),
-                    counted: true,
-                })
-            }
+        let queue = self.workspace_queue(workspace_id);
+        let mut state = queue.lock().expect("turn scheduler workspace queue");
+        if !state.active && !state.handoff_pending && state.waiters.is_empty() {
+            state.active = true;
+            debug!(
+                target: "lucarne::control_plane::turn_queue",
+                workspace_id = %workspace_id.as_str(),
+                "turn admitted"
+            );
+            return TurnAdmission::Ready(TurnPermit {
+                queued_position: None,
+                workspace_id: workspace_id.clone(),
+                scheduler: self.clone(),
+            });
         }
+
+        let position = state.waiters.len() + usize::from(state.handoff_pending) + 1;
+        let (tx, rx) = oneshot::channel();
+        let waiter = Arc::new(QueuedWaiter {
+            id: self.next_waiter_id.fetch_add(1, Ordering::Relaxed),
+            grant: StdMutex::new(Some(tx)),
+        });
+        state.waiters.push_back(Arc::clone(&waiter));
+        debug!(
+            target: "lucarne::control_plane::turn_queue",
+            workspace_id = %workspace_id.as_str(),
+            position,
+            "turn queued"
+        );
+        TurnAdmission::Queued(QueuedTurn {
+            workspace_id: workspace_id.clone(),
+            position,
+            scheduler: self.clone(),
+            waiter: Some(waiter),
+            receiver: Some(rx),
+            counted: true,
+        })
     }
 
     pub async fn acquire(&self, workspace_id: &WorkspaceId) -> TurnPermit {
         self.admit(workspace_id).wait().await
     }
 
-    fn workspace_lock(&self, workspace_id: &WorkspaceId) -> Arc<AsyncMutex<()>> {
-        if let Some(lock) = self
-            .locks
+    fn workspace_queue(&self, workspace_id: &WorkspaceId) -> Arc<StdMutex<WorkspaceQueue>> {
+        if let Some(queue) = self
+            .queues
             .read()
             .expect("turn scheduler lock registry")
             .get(workspace_id)
             .cloned()
         {
-            return lock;
+            return queue;
         }
 
-        self.locks
+        self.queues
             .write()
             .expect("turn scheduler lock registry")
             .entry(workspace_id.clone())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .or_insert_with(|| Arc::new(StdMutex::new(WorkspaceQueue::default())))
             .clone()
     }
 
-    fn note_queued(&self, workspace_id: &WorkspaceId) -> usize {
-        let mut waiters = self.waiters.lock().unwrap();
-        let count = waiters.entry(workspace_id.clone()).or_insert(0);
-        *count += 1;
-        *count
-    }
-
-    fn note_dequeued(&self, workspace_id: &WorkspaceId) {
-        let mut waiters = self.waiters.lock().unwrap();
-        match waiters.get_mut(workspace_id) {
-            Some(1) => {
-                waiters.remove(workspace_id);
+    fn release_next(&self, workspace_id: &WorkspaceId) {
+        let Some(queue) = self.existing_workspace_queue(workspace_id) else {
+            return;
+        };
+        loop {
+            let next = {
+                let mut state = queue.lock().expect("turn scheduler workspace queue");
+                state.handoff_pending = false;
+                match state.waiters.pop_front() {
+                    Some(waiter) => {
+                        state.active = true;
+                        state.handoff_pending = true;
+                        Some(waiter)
+                    }
+                    None => {
+                        state.active = false;
+                        None
+                    }
+                }
+            };
+            let Some(waiter) = next else {
+                return;
+            };
+            if waiter.grant() {
+                return;
             }
-            Some(count) => {
-                *count -= 1;
-            }
-            None => {}
         }
     }
+
+    fn note_handoff_started(&self, workspace_id: &WorkspaceId) {
+        if let Some(queue) = self.existing_workspace_queue(workspace_id) {
+            queue
+                .lock()
+                .expect("turn scheduler workspace queue")
+                .handoff_pending = false;
+        }
+    }
+
+    fn cancel_queued(&self, workspace_id: &WorkspaceId, waiter_id: u64) -> CancelOutcome {
+        let Some(queue) = self.existing_workspace_queue(workspace_id) else {
+            return CancelOutcome::Missing;
+        };
+        let mut state = queue.lock().expect("turn scheduler workspace queue");
+        if let Some(index) = state
+            .waiters
+            .iter()
+            .position(|waiter| waiter.id == waiter_id)
+        {
+            state.waiters.remove(index);
+            return CancelOutcome::Removed;
+        }
+        if state.handoff_pending {
+            state.handoff_pending = false;
+            return CancelOutcome::PendingHandoff;
+        }
+        CancelOutcome::Missing
+    }
+
+    fn existing_workspace_queue(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<Arc<StdMutex<WorkspaceQueue>>> {
+        self.queues
+            .read()
+            .expect("turn scheduler lock registry")
+            .get(workspace_id)
+            .cloned()
+    }
+}
+
+#[derive(Debug, Default)]
+struct WorkspaceQueue {
+    active: bool,
+    handoff_pending: bool,
+    waiters: VecDeque<Arc<QueuedWaiter>>,
+}
+
+#[derive(Debug)]
+struct QueuedWaiter {
+    id: u64,
+    grant: StdMutex<Option<oneshot::Sender<()>>>,
+}
+
+impl QueuedWaiter {
+    fn grant(&self) -> bool {
+        self.grant
+            .lock()
+            .expect("turn scheduler queued waiter")
+            .take()
+            .is_some_and(|grant| grant.send(()).is_ok())
+    }
+
+    fn cancel(&self) {
+        self.grant
+            .lock()
+            .expect("turn scheduler queued waiter")
+            .take();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelOutcome {
+    Removed,
+    PendingHandoff,
+    Missing,
 }
 
 #[cfg(test)]
@@ -230,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_scheduler_uses_read_optimized_workspace_lock_registry() {
+    fn turn_scheduler_uses_read_optimized_workspace_queue_registry() {
         let source = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("src/control_plane/turn_queue.rs"),
@@ -242,12 +349,14 @@ mod tests {
             .expect("production source");
 
         assert!(
-            production.contains("locks: Arc<StdRwLock<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>"),
-            "workspace lock registry should allow read-only lookups without taking an exclusive map lock"
+            production.contains(
+                "queues: Arc<StdRwLock<HashMap<WorkspaceId, Arc<StdMutex<WorkspaceQueue>>>>>"
+            ),
+            "workspace queue registry should allow read-only lookups without taking an exclusive map lock"
         );
         assert!(
-            !production.contains("locks: Arc<StdMutex<HashMap<WorkspaceId, Arc<AsyncMutex<()>>>>>"),
-            "workspace lock registry should not use a global mutex for every turn admission"
+            !production.contains("queues: Arc<StdMutex<HashMap<WorkspaceId, WorkspaceQueue>>>"),
+            "workspace queue registry should not use a global mutex for every turn admission"
         );
     }
 
@@ -280,13 +389,48 @@ mod tests {
         assert_eq!(
             later.queued_position(),
             Some(2),
-            "a later turn must not overtake a queued turn while Telegram sends its queue notice"
+            "a later turn must not overtake a queued turn while the caller sends its queue notice"
         );
 
         drop(queued);
         timeout(Duration::from_secs(1), later.wait())
             .await
             .expect("later turn should acquire after queued turn is cancelled");
+    }
+
+    #[tokio::test]
+    async fn later_turn_cannot_overtake_unpolled_queued_turn_after_release() {
+        let scheduler = TurnScheduler::new();
+        let workspace = WorkspaceId::new("ws");
+        let first = scheduler.acquire(&workspace).await;
+
+        let queued = scheduler.admit(&workspace);
+        assert_eq!(queued.queued_position(), Some(1));
+        drop(first);
+
+        let later = scheduler.admit(&workspace);
+        assert_eq!(
+            later.queued_position(),
+            Some(2),
+            "a later turn must queue behind the older turn even before the older caller awaits its permit"
+        );
+
+        let later = tokio::spawn(async move { later.wait().await });
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            !later.is_finished(),
+            "later turn must not acquire before the older queued turn is awaited and released"
+        );
+
+        let queued = timeout(Duration::from_secs(1), queued.wait())
+            .await
+            .expect("older queued turn should acquire");
+        drop(queued);
+        let later = timeout(Duration::from_secs(1), later)
+            .await
+            .expect("later turn should acquire after older queued turn releases")
+            .expect("later turn task");
+        assert_eq!(later.queued_position(), Some(2));
     }
 
     #[tokio::test]

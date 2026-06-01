@@ -29,7 +29,7 @@ use lucarne::{
         ReasoningEvent, ResumeSession, SessionId, SessionRef, ToolCallEvent, ToolResultEvent,
     },
     control_plane::{
-        ChannelBinding, ChannelBindingId, ControlPlaneSqliteStore, ProviderSessionId,
+        ChannelBinding, ChannelBindingId, ControlPlaneSqliteStore, ProviderSessionId, TurnSource,
         WorkspaceId as ControlWorkspaceId,
     },
     core_service::{LucarneCore, OpenWorkspaceRequest, ResumeWorkspaceRequest, SubmitTurnRequest},
@@ -2224,10 +2224,12 @@ async fn live_record_watch_notification_replay_cassette_codex() {
         live_watch_recording_timeout(),
         core.submit_turn(SubmitTurnRequest {
             workspace_id: workspace_id.clone(),
+            source: TurnSource::UserMessage,
             input: AgentInput {
                 text: background_prompt.into(),
                 images: Vec::new(),
             },
+            reply_to_channel_message_id: None,
         }),
     )
     .await
@@ -2420,7 +2422,7 @@ async fn watch_does_not_duplicate_notifications_for_active_bot_conversation() {
             .all(|(_, title, _)| title != "agent notifications"),
         "normal topic conversations should not create notification topics"
     );
-    let mut answer_message_ids = topic_messages(&channel, "9")
+    let mut answer_message_ids = active_topic_messages(&channel, "9")
         .iter()
         .filter(|sent| sent.message.body.contains("normal topic answer"))
         .map(|sent| sent.id.clone())

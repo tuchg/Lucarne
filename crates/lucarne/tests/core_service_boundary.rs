@@ -7,7 +7,7 @@ use lucarne::{
         AgentProvider, AgentSession, Event, InstanceId, InterventionResponse, MessageEvent,
         MessageRole, OpenSession, ProbeResult, ResumeSession, SessionId,
     },
-    control_plane::{ControlPlaneSqliteStore, ScheduledTaskId, WorkspaceId},
+    control_plane::{ControlPlaneSqliteStore, ScheduledTaskId, TurnSource, WorkspaceId},
     core_service::{
         CoreEvent, DaemonApi, OpenWorkspaceRequest, ResumeWorkspaceRequest,
         RunDueScheduledTasksRequest, UpsertScheduledTaskRequest,
@@ -41,7 +41,7 @@ fn core_service_does_not_write_sqlite_while_holding_state_mutex() {
         "live session registry should not use an async mutex for in-memory map access"
     );
     assert!(
-        service.contains("state: RwLock<ControlPlaneState>"),
+        service.contains("state: Arc<RwLock<ControlPlaneState>>"),
         "core control-plane cache should allow concurrent read-only daemon queries"
     );
     assert!(
@@ -602,10 +602,12 @@ async fn core_pumps_provider_events_to_daemon_event_stream() {
 
     core.submit_turn(lucarne::core_service::SubmitTurnRequest {
         workspace_id: workspace_id.clone(),
+        source: TurnSource::UserMessage,
         input: AgentInput {
             text: "hello".into(),
             images: vec![],
         },
+        reply_to_channel_message_id: None,
     })
     .await
     .expect("submit");
@@ -679,10 +681,12 @@ async fn journey_34_dual_channel_core_event_delivers_to_both_telegram_and_wechat
 
     core.submit_turn(lucarne::core_service::SubmitTurnRequest {
         workspace_id: workspace_id.clone(),
+        source: TurnSource::UserMessage,
         input: AgentInput {
             text: "notify both".into(),
             images: vec![],
         },
+        reply_to_channel_message_id: None,
     })
     .await
     .expect("submit turn");

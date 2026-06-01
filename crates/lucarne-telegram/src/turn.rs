@@ -16,9 +16,11 @@
 
 use base64::Engine as _;
 #[cfg(test)]
+use lucarne::agent_runtime::AgentInput;
+#[cfg(test)]
 use lucarne::agent_runtime::InterventionRequest;
 use lucarne::agent_runtime::{
-    AgentCommandInvocation, AgentCommandResult, AgentCommandResultData, AgentInput, AgentStatus,
+    AgentCommandInvocation, AgentCommandResult, AgentCommandResultData, AgentStatus,
     Attachment as AgentAttachment, CommandResultEvent, Event, InstanceId, MessageEvent,
     MessageRole,
 };
@@ -447,15 +449,7 @@ fn log_event_json(value: &serde_json::Value) -> String {
     log_event_text(&value.to_string(), EVENT_LOG_TEXT_MAX)
 }
 
-pub(crate) async fn run_turn_with_options(
-    channel: &Arc<dyn Channel>,
-    target: &WorkspaceHandle,
-    live: &LiveSession,
-    input: AgentInput,
-    provider_id: &str,
-    options: TurnRunOptions,
-    reply_to: Option<MessageId>,
-) -> Result<TurnRunReport, String> {
+pub(crate) async fn prepare_turn_drain(live: &LiveSession) {
     // 0. Drop any leftover events from a prior turn. With
     //    `Event::TurnCompleted` now being the authoritative end-of-turn
     //    signal, this should almost always be empty in practice — if
@@ -471,14 +465,16 @@ pub(crate) async fn run_turn_with_options(
             "discarded stale events from previous turn (inspect logs above for event kinds)"
         );
     }
+}
 
-    // 1. Submit the prompt.
-    live.session
-        .submit_turn(input)
-        .await
-        .map_err(|e| e.to_string())?;
-    debug!("prompt submitted");
-
+pub(crate) async fn drain_turn_with_options(
+    channel: &Arc<dyn Channel>,
+    target: &WorkspaceHandle,
+    live: &LiveSession,
+    provider_id: &str,
+    options: TurnRunOptions,
+    reply_to: Option<MessageId>,
+) -> Result<TurnRunReport, String> {
     drain_submitted_events(
         channel,
         target,

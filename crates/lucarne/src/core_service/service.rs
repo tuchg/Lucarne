@@ -36,7 +36,8 @@ use crate::{
         ProviderSessionId, ProviderSessionRecord, ReconcileOutcome, Revision, ScheduledTaskId,
         ScheduledTaskRecord, StatusSnapshot, SubAgentActionRecord, SubAgentCallbackRecord,
         SubAgentCallbackToken, SubAgentLinkId, SubAgentLinkRecord, SystemSettings, TimelineItem,
-        TimelineItemKind, TurnId, TurnRecord, TurnSource, TurnState, WorkspaceBinding, WorkspaceId,
+        TimelineItemKind, TurnId, TurnPermit, TurnRecord, TurnScheduler, TurnSource, TurnState,
+        WorkspaceBinding, WorkspaceId,
     },
     dialect::PermissionMode,
     host::process_table::{self, ProcessAggregate, ProcessSample},
@@ -85,7 +86,7 @@ impl From<ControlPlaneError> for CoreError {
 
 pub struct LucarneCore {
     runtime: Arc<AgentRuntime>,
-    state: RwLock<ControlPlaneState>,
+    state: Arc<RwLock<ControlPlaneState>>,
     store: ControlPlaneSqliteStore,
     provider_ids: Vec<&'static str>,
     events: broadcast::Sender<CoreEvent>,
@@ -96,10 +97,11 @@ pub struct LucarneCore {
     live_runtime_terminal_text_claims:
         Arc<RwLock<HashMap<LiveRuntimeTerminalTextClaimKey, Instant>>>,
     next_live_generation: AtomicU64,
+    submitted_turn_scheduler: TurnScheduler,
     submitted_turns: Arc<RwLock<HashMap<WorkspaceId, VecDeque<TurnId>>>>,
     submitted_turn_activity: Arc<RwLock<HashMap<TurnId, SubmittedTurnActivity>>>,
+    submitted_turn_permits: Arc<RwLock<HashMap<TurnId, TurnPermit>>>,
     live_runtime_turn_claims: Arc<RwLock<HashMap<LiveRuntimeTurnClaimKey, Instant>>>,
-    next_submitted_turn: AtomicU64,
     notification_suppression: RwLock<HashMap<WorkspaceId, usize>>,
     notification_suppression_grace: RwLock<HashMap<WorkspaceId, Instant>>,
     history_watch_started: AtomicBool,
@@ -300,7 +302,7 @@ impl LucarneCore {
         );
         Ok(Arc::new(Self {
             runtime,
-            state: RwLock::new(state),
+            state: Arc::new(RwLock::new(state)),
             store,
             history: crate::history::HistoryIndex::new(history_providers, Duration::from_secs(30)),
             provider_ids,
@@ -310,10 +312,11 @@ impl LucarneCore {
             live_session_generations: Arc::new(RwLock::new(HashMap::new())),
             live_runtime_terminal_text_claims: Arc::new(RwLock::new(HashMap::new())),
             next_live_generation: AtomicU64::new(0),
+            submitted_turn_scheduler: TurnScheduler::new(),
             submitted_turns: Arc::new(RwLock::new(HashMap::new())),
             submitted_turn_activity: Arc::new(RwLock::new(HashMap::new())),
+            submitted_turn_permits: Arc::new(RwLock::new(HashMap::new())),
             live_runtime_turn_claims: Arc::new(RwLock::new(HashMap::new())),
-            next_submitted_turn: AtomicU64::new(0),
             notification_suppression: RwLock::new(HashMap::new()),
             notification_suppression_grace: RwLock::new(HashMap::new()),
             history_watch_started: AtomicBool::new(false),
@@ -1456,10 +1459,33 @@ impl LucarneCore {
     pub async fn submit_turn(&self, req: SubmitTurnRequest) -> Result<SubmittedTurn, CoreError> {
         let SubmitTurnRequest {
             workspace_id,
+            source,
             input,
+            reply_to_channel_message_id,
         } = req;
+        let turn_permit = self.submitted_turn_scheduler.acquire(&workspace_id).await;
         let live = self.live_session(&workspace_id).await?;
-        let turn_id = self.next_submitted_turn_id();
+        let provider_session_id = self.active_provider_session_id(&workspace_id)?;
+        let live_instance_id = LiveInstanceId::new(live.instance_id().0.as_str());
+        let input_text = input.text.clone();
+        let turn = self.start_turn(
+            workspace_id.clone(),
+            provider_session_id,
+            live_instance_id,
+            source,
+            input_text.clone(),
+            reply_to_channel_message_id,
+        )?;
+        if source == TurnSource::UserMessage {
+            self.append_timeline(TimelineItem::new(
+                workspace_id.clone(),
+                turn.turn_id.clone(),
+                TimelineItemKind::User,
+                serde_json::json!({ "text": input_text.as_str() }),
+            ))?;
+        }
+        let turn_id = turn.turn_id;
+        self.remember_submitted_turn(workspace_id.clone(), turn_id.clone(), turn_permit);
         debug!(
             target: "lucarne::core_service",
             workspace_id = %workspace_id.as_str(),
@@ -1468,10 +1494,20 @@ impl LucarneCore {
             image_count = input.images.len(),
             "submitting turn"
         );
-        self.remember_submitted_turn(workspace_id.clone(), turn_id.clone());
         self.spawn_submitted_turn_watchdog(workspace_id.clone(), turn_id.clone());
         if let Err(err) = live.submit(input).await {
-            self.remove_submitted_turn(&workspace_id, &turn_id);
+            let error = err.to_string();
+            if let Err(fail_err) = self.fail_turn(turn_id.clone(), &error) {
+                warn!(
+                    target: "lucarne::core_service",
+                    workspace_id = %workspace_id.as_str(),
+                    turn_id = %turn_id.as_str(),
+                    submit_error = %error,
+                    fail_error = %fail_err,
+                    "failed to mark turn failed after live submit error"
+                );
+                self.remove_submitted_turn(&workspace_id, &turn_id);
+            }
             return Err(err.into());
         }
         let _ = self.events.send(CoreEvent::TurnStarted { workspace_id });
@@ -1572,10 +1608,12 @@ impl LucarneCore {
         let submitted = self
             .submit_turn(SubmitTurnRequest {
                 workspace_id: task.workspace_id.clone(),
+                source: TurnSource::System,
                 input: crate::agent_runtime::AgentInput {
                     text: task.prompt.to_string().into(),
                     images: Vec::new(),
                 },
+                reply_to_channel_message_id: None,
             })
             .await?;
         let updated_task = {
@@ -1604,6 +1642,18 @@ impl LucarneCore {
             .interrupt()
             .await?;
         Ok(())
+    }
+
+    pub fn live_session_is_bound(
+        &self,
+        workspace_id: &WorkspaceId,
+        live_instance_id: &LiveInstanceId,
+    ) -> bool {
+        self.live_sessions
+            .read()
+            .expect("live session registry lock")
+            .get(workspace_id)
+            .is_some_and(|session| session.instance_id().0.as_str() == live_instance_id.as_str())
     }
 
     pub async fn resolve_permission(&self, req: ResolvePermissionRequest) -> Result<(), CoreError> {
@@ -2111,10 +2161,13 @@ impl LucarneCore {
         let workspace_events = self.workspace_event_sender(&workspace_id);
         let submitted_turns = Arc::clone(&self.submitted_turns);
         let submitted_turn_activity = Arc::clone(&self.submitted_turn_activity);
+        let submitted_turn_permits = Arc::clone(&self.submitted_turn_permits);
         let live_sessions = Arc::clone(&self.live_sessions);
         let live_session_generations = Arc::clone(&self.live_session_generations);
         let live_runtime_turn_claims = Arc::clone(&self.live_runtime_turn_claims);
         let live_runtime_terminal_text_claims = Arc::clone(&self.live_runtime_terminal_text_claims);
+        let state = Arc::clone(&self.state);
+        let store = self.store.clone();
         let provider_id = session.provider_id();
         tokio::spawn(async move {
             let mut last_assistant_message: Option<SmolStr> = None;
@@ -2186,7 +2239,7 @@ impl LucarneCore {
                         }
                         let lifecycle = match &event {
                             AgentEvent::TurnCompleted(completed) => {
-                                if turn_id.is_some() {
+                                if let Some(turn_id) = turn_id.as_ref() {
                                     let native_session = session
                                         .provider_session_id()
                                         .await
@@ -2209,6 +2262,33 @@ impl LucarneCore {
                                             );
                                         }
                                     }
+                                    let usage = completed
+                                        .usage
+                                        .clone()
+                                        .map(serde_json::to_value)
+                                        .transpose()
+                                        .map_err(|err| {
+                                            CoreError::invalid_state(format!(
+                                                "failed to serialize turn completion usage: {err}"
+                                            ))
+                                        });
+                                    match usage.and_then(|usage| {
+                                        complete_turn_record_with_usage_value(
+                                            &store,
+                                            &state,
+                                            turn_id.clone(),
+                                            usage,
+                                        )
+                                    }) {
+                                        Ok(_) => {}
+                                        Err(err) => warn!(
+                                            target: "lucarne::core_service",
+                                            workspace_id = %workspace_id.as_str(),
+                                            turn_id = %turn_id.as_str(),
+                                            error = %err,
+                                            "failed to complete submitted turn record"
+                                        ),
+                                    }
                                 }
                                 last_assistant_message = None;
                                 Some(CoreEvent::TurnCompleted {
@@ -2216,7 +2296,7 @@ impl LucarneCore {
                                 })
                             }
                             AgentEvent::TurnFailed(failed) => {
-                                if turn_id.is_some() {
+                                if let Some(turn_id) = turn_id.as_ref() {
                                     let native_session = session
                                         .provider_session_id()
                                         .await
@@ -2229,6 +2309,20 @@ impl LucarneCore {
                                         ),
                                         failed.turn_id.clone(),
                                     );
+                                    if let Err(err) = fail_turn_record(
+                                        &store,
+                                        &state,
+                                        turn_id.clone(),
+                                        failed.error.as_str(),
+                                    ) {
+                                        warn!(
+                                            target: "lucarne::core_service",
+                                            workspace_id = %workspace_id.as_str(),
+                                            turn_id = %turn_id.as_str(),
+                                            error = %err,
+                                            "failed to fail submitted turn record"
+                                        );
+                                    }
                                 }
                                 last_assistant_message = None;
                                 Some(CoreEvent::TurnFailed {
@@ -2256,6 +2350,7 @@ impl LucarneCore {
                                 pop_submitted_turn(
                                     &submitted_turns,
                                     &submitted_turn_activity,
+                                    &submitted_turn_permits,
                                     &workspace_id,
                                 );
                             }
@@ -2268,9 +2363,19 @@ impl LucarneCore {
                 if pop_submitted_turn_if_current(
                     &submitted_turns,
                     &submitted_turn_activity,
+                    &submitted_turn_permits,
                     &workspace_id,
                     &turn_id,
                 ) {
+                    if let Err(err) = fail_turn_record(&store, &state, turn_id.clone(), &error) {
+                        warn!(
+                            target: "lucarne::core_service",
+                            workspace_id = %workspace_id.as_str(),
+                            turn_id = %turn_id.as_str(),
+                            error = %err,
+                            "failed to fail submitted turn record after event stream closed"
+                        );
+                    }
                     emit_submitted_turn_failure(
                         &events,
                         &workspace_events,
@@ -3485,15 +3590,6 @@ impl LucarneCore {
             (turn, entities)
         };
         self.upsert_persistence_entities(entities)?;
-        if matches!(source, TurnSource::UserMessage | TurnSource::Command)
-            && self
-                .live_sessions
-                .read()
-                .expect("live session registry lock")
-                .contains_key(&turn.workspace_id)
-        {
-            self.remember_submitted_turn(turn.workspace_id.clone(), turn.turn_id.clone());
-        }
         Ok(turn)
     }
 
@@ -3560,32 +3656,12 @@ impl LucarneCore {
         turn_id: TurnId,
         usage: Option<serde_json::Value>,
     ) -> Result<(), CoreError> {
-        let Some(turn_record) = self.store.turn(&turn_id)? else {
-            return Err(ControlPlaneError::MissingTurn(turn_id).into());
-        };
-        let live_owner = self
-            .store
-            .workspace_id_for_live_instance(&turn_record.live_instance_id)?;
-        let Some(live_record) = self.store.live_instance(&turn_record.live_instance_id)? else {
-            return Err(
-                ControlPlaneError::MissingLiveInstance(turn_record.live_instance_id).into(),
-            );
-        };
-        let (workspace_id, live_instance_id, entities) = {
-            let mut state = self.state.write().expect("control plane lock");
-            state.record_turn_projection(turn_record);
-            state.record_live_instance_projection(live_record, live_owner);
-            let turn = state.complete_turn_with_usage(turn_id.clone(), usage)?;
-            let workspace_id = turn.workspace_id;
-            let live_instance_id = turn.live_instance_id.clone();
-            let entities = state.persistence_entities_for_turn_lifecycle(&turn_id);
-            (workspace_id, live_instance_id, entities)
-        };
-        self.store
-            .delete_intervention_callbacks_for_live_instances(std::slice::from_ref(
-                &live_instance_id,
-            ))?;
-        self.upsert_persistence_entities(entities)?;
+        let workspace_id = complete_turn_record_with_usage_value(
+            &self.store,
+            &self.state,
+            turn_id.clone(),
+            usage,
+        )?;
         self.remove_submitted_turn(&workspace_id, &turn_id);
         Ok(())
     }
@@ -3654,32 +3730,7 @@ impl LucarneCore {
     }
 
     pub fn fail_turn(&self, turn_id: TurnId, error: &str) -> Result<(), CoreError> {
-        let Some(turn_record) = self.store.turn(&turn_id)? else {
-            return Err(ControlPlaneError::MissingTurn(turn_id).into());
-        };
-        let live_owner = self
-            .store
-            .workspace_id_for_live_instance(&turn_record.live_instance_id)?;
-        let Some(live_record) = self.store.live_instance(&turn_record.live_instance_id)? else {
-            return Err(
-                ControlPlaneError::MissingLiveInstance(turn_record.live_instance_id).into(),
-            );
-        };
-        let (workspace_id, live_instance_id, entities) = {
-            let mut state = self.state.write().expect("control plane lock");
-            state.record_turn_projection(turn_record);
-            state.record_live_instance_projection(live_record, live_owner);
-            let turn = state.fail_turn(turn_id.clone(), error)?;
-            let workspace_id = turn.workspace_id;
-            let live_instance_id = turn.live_instance_id.clone();
-            let entities = state.persistence_entities_for_turn_lifecycle(&turn_id);
-            (workspace_id, live_instance_id, entities)
-        };
-        self.store
-            .delete_intervention_callbacks_for_live_instances(std::slice::from_ref(
-                &live_instance_id,
-            ))?;
-        self.upsert_persistence_entities(entities)?;
+        let workspace_id = fail_turn_record(&self.store, &self.state, turn_id.clone(), error)?;
         self.remove_submitted_turn(&workspace_id, &turn_id);
         Ok(())
     }
@@ -4019,6 +4070,10 @@ impl LucarneCore {
                 .write()
                 .expect("submitted turn activity lock")
                 .retain(|turn_id, _| !removed_turns.contains(turn_id));
+            self.submitted_turn_permits
+                .write()
+                .expect("submitted turn permit lock")
+                .retain(|turn_id, _| !removed_turns.contains(turn_id));
         }
         session
     }
@@ -4081,12 +4136,12 @@ impl LucarneCore {
             .ok_or_else(|| CoreError::invalid_state("workspace has no live session"))
     }
 
-    fn next_submitted_turn_id(&self) -> TurnId {
-        let next = self.next_submitted_turn.fetch_add(1, Ordering::SeqCst) + 1;
-        TurnId::new(format!("submitted-turn-{next}"))
-    }
-
-    fn remember_submitted_turn(&self, workspace_id: WorkspaceId, turn_id: TurnId) {
+    fn remember_submitted_turn(
+        &self,
+        workspace_id: WorkspaceId,
+        turn_id: TurnId,
+        turn_permit: TurnPermit,
+    ) {
         let now = Instant::now();
         self.submitted_turns
             .write()
@@ -4098,12 +4153,16 @@ impl LucarneCore {
             .write()
             .expect("submitted turn activity lock")
             .insert(
-                turn_id,
+                turn_id.clone(),
                 SubmittedTurnActivity {
                     last_event_at: now,
                     waiting_intervention: false,
                 },
             );
+        self.submitted_turn_permits
+            .write()
+            .expect("submitted turn permit lock")
+            .insert(turn_id, turn_permit);
     }
 
     fn remove_submitted_turn(&self, workspace_id: &WorkspaceId, turn_id: &TurnId) {
@@ -4118,6 +4177,7 @@ impl LucarneCore {
             .write()
             .expect("submitted turn activity lock")
             .remove(turn_id);
+        release_submitted_turn_permit(&self.submitted_turn_permits, turn_id);
     }
 
     fn spawn_submitted_turn_watchdog(&self, workspace_id: WorkspaceId, turn_id: TurnId) {
@@ -4125,6 +4185,9 @@ impl LucarneCore {
         let workspace_events = self.workspace_event_sender(&workspace_id);
         let submitted_turns = Arc::clone(&self.submitted_turns);
         let submitted_turn_activity = Arc::clone(&self.submitted_turn_activity);
+        let submitted_turn_permits = Arc::clone(&self.submitted_turn_permits);
+        let state = Arc::clone(&self.state);
+        let store = self.store.clone();
         let options = self.options.clone();
         tokio::spawn(async move {
             loop {
@@ -4154,6 +4217,7 @@ impl LucarneCore {
                 if !pop_submitted_turn_if_current(
                     &submitted_turns,
                     &submitted_turn_activity,
+                    &submitted_turn_permits,
                     &workspace_id,
                     &turn_id,
                 ) {
@@ -4166,6 +4230,15 @@ impl LucarneCore {
                     error = %error,
                     "submitted turn watchdog failed stuck live turn without closing live session"
                 );
+                if let Err(err) = fail_turn_record(&store, &state, turn_id.clone(), &error) {
+                    warn!(
+                        target: "lucarne::core_service",
+                        workspace_id = %workspace_id.as_str(),
+                        turn_id = %turn_id.as_str(),
+                        error = %err,
+                        "failed to fail submitted turn record after watchdog timeout"
+                    );
+                }
                 emit_submitted_turn_failure(
                     &events,
                     &workspace_events,
@@ -4177,6 +4250,66 @@ impl LucarneCore {
             }
         });
     }
+}
+
+fn complete_turn_record_with_usage_value(
+    store: &ControlPlaneSqliteStore,
+    state: &Arc<RwLock<ControlPlaneState>>,
+    turn_id: TurnId,
+    usage: Option<serde_json::Value>,
+) -> Result<WorkspaceId, CoreError> {
+    let Some(turn_record) = store.turn(&turn_id)? else {
+        return Err(ControlPlaneError::MissingTurn(turn_id).into());
+    };
+    let live_owner = store.workspace_id_for_live_instance(&turn_record.live_instance_id)?;
+    let Some(live_record) = store.live_instance(&turn_record.live_instance_id)? else {
+        return Err(ControlPlaneError::MissingLiveInstance(turn_record.live_instance_id).into());
+    };
+    let (workspace_id, live_instance_id, entities) = {
+        let mut state = state.write().expect("control plane lock");
+        state.record_turn_projection(turn_record);
+        state.record_live_instance_projection(live_record, live_owner);
+        let turn = state.complete_turn_with_usage(turn_id.clone(), usage)?;
+        let workspace_id = turn.workspace_id;
+        let live_instance_id = turn.live_instance_id.clone();
+        let entities = state.persistence_entities_for_turn_lifecycle(&turn_id);
+        (workspace_id, live_instance_id, entities)
+    };
+    store.delete_intervention_callbacks_for_live_instances(std::slice::from_ref(
+        &live_instance_id,
+    ))?;
+    store.upsert_entities(entities)?;
+    Ok(workspace_id)
+}
+
+fn fail_turn_record(
+    store: &ControlPlaneSqliteStore,
+    state: &Arc<RwLock<ControlPlaneState>>,
+    turn_id: TurnId,
+    error: &str,
+) -> Result<WorkspaceId, CoreError> {
+    let Some(turn_record) = store.turn(&turn_id)? else {
+        return Err(ControlPlaneError::MissingTurn(turn_id).into());
+    };
+    let live_owner = store.workspace_id_for_live_instance(&turn_record.live_instance_id)?;
+    let Some(live_record) = store.live_instance(&turn_record.live_instance_id)? else {
+        return Err(ControlPlaneError::MissingLiveInstance(turn_record.live_instance_id).into());
+    };
+    let (workspace_id, live_instance_id, entities) = {
+        let mut state = state.write().expect("control plane lock");
+        state.record_turn_projection(turn_record);
+        state.record_live_instance_projection(live_record, live_owner);
+        let turn = state.fail_turn(turn_id.clone(), error)?;
+        let workspace_id = turn.workspace_id;
+        let live_instance_id = turn.live_instance_id.clone();
+        let entities = state.persistence_entities_for_turn_lifecycle(&turn_id);
+        (workspace_id, live_instance_id, entities)
+    };
+    store.delete_intervention_callbacks_for_live_instances(std::slice::from_ref(
+        &live_instance_id,
+    ))?;
+    store.upsert_entities(entities)?;
+    Ok(workspace_id)
 }
 
 async fn recv_agent_activity(activity_source: &mut Option<AgentActivityStream>) -> Option<()> {
@@ -4364,6 +4497,7 @@ fn submitted_turn_is_current(
 fn pop_submitted_turn(
     submitted_turns: &Arc<RwLock<HashMap<WorkspaceId, VecDeque<TurnId>>>>,
     activity: &Arc<RwLock<HashMap<TurnId, SubmittedTurnActivity>>>,
+    permits: &Arc<RwLock<HashMap<TurnId, TurnPermit>>>,
     workspace_id: &WorkspaceId,
 ) {
     let mut submitted_turns = submitted_turns.write().expect("submitted turn lock");
@@ -4380,12 +4514,14 @@ fn pop_submitted_turn(
             .write()
             .expect("submitted turn activity lock")
             .remove(&turn_id);
+        release_submitted_turn_permit(permits, &turn_id);
     }
 }
 
 fn pop_submitted_turn_if_current(
     submitted_turns: &Arc<RwLock<HashMap<WorkspaceId, VecDeque<TurnId>>>>,
     activity: &Arc<RwLock<HashMap<TurnId, SubmittedTurnActivity>>>,
+    permits: &Arc<RwLock<HashMap<TurnId, TurnPermit>>>,
     workspace_id: &WorkspaceId,
     turn_id: &TurnId,
 ) -> bool {
@@ -4405,7 +4541,18 @@ fn pop_submitted_turn_if_current(
         .write()
         .expect("submitted turn activity lock")
         .remove(turn_id);
+    release_submitted_turn_permit(permits, turn_id);
     true
+}
+
+fn release_submitted_turn_permit(
+    permits: &Arc<RwLock<HashMap<TurnId, TurnPermit>>>,
+    turn_id: &TurnId,
+) {
+    permits
+        .write()
+        .expect("submitted turn permit lock")
+        .remove(turn_id);
 }
 
 fn mark_current_submitted_turn_intervention_resolved(
@@ -4851,6 +4998,7 @@ mod tests {
     use agent_sessions::{
         WatchAssistantMessage, WatchAttachment, WatchEventMeta, WatchMessage, WatchTurnFailed,
     };
+    use tokio::sync::Notify;
 
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -5768,20 +5916,24 @@ mod tests {
         let first = core
             .submit_turn(SubmitTurnRequest {
                 workspace_id: opened.workspace.workspace_id.clone(),
+                source: TurnSource::UserMessage,
                 input: crate::agent_runtime::AgentInput {
                     text: "first".into(),
                     images: Vec::new(),
                 },
+                reply_to_channel_message_id: None,
             })
             .await
             .expect("submit first");
         let second = core
             .submit_turn(SubmitTurnRequest {
                 workspace_id: opened.workspace.workspace_id.clone(),
+                source: TurnSource::UserMessage,
                 input: crate::agent_runtime::AgentInput {
                     text: "second".into(),
                     images: Vec::new(),
                 },
+                reply_to_channel_message_id: None,
             })
             .await
             .expect("submit second");
@@ -5814,6 +5966,88 @@ mod tests {
                 (first.turn_id, "reply: first".into()),
                 (second.turn_id, "reply: second".into())
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_turns_wait_for_prior_turn_completion_per_workspace() {
+        let state = Arc::new(BlockingSubmitState::default());
+        let runtime = Arc::new(AgentRuntime::new());
+        runtime.register(Arc::new(BlockingSubmitProvider {
+            state: Arc::clone(&state),
+        }));
+        let core = LucarneCore::from_runtime_and_store(
+            runtime,
+            ControlPlaneSqliteStore::open_in_memory().expect("store"),
+        )
+        .expect("core");
+        let opened = core
+            .open_workspace_with_events(OpenWorkspaceRequest {
+                provider_id: "codex",
+                project_path: Some(PathBuf::from("/tmp/submitted-turn-fifo")),
+                title: "submitted turn fifo".into(),
+            })
+            .await
+            .expect("open workspace");
+        let workspace_id = opened.workspace.workspace_id.clone();
+
+        let first_core = Arc::clone(&core);
+        let first_workspace = workspace_id.clone();
+        let first = tokio::spawn(async move {
+            first_core
+                .submit_turn(SubmitTurnRequest {
+                    workspace_id: first_workspace,
+                    source: TurnSource::UserMessage,
+                    input: crate::agent_runtime::AgentInput {
+                        text: "first".into(),
+                        images: Vec::new(),
+                    },
+                    reply_to_channel_message_id: None,
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), state.first_submitted.notified())
+            .await
+            .expect("first submit should reach provider");
+
+        let second_core = Arc::clone(&core);
+        let second_workspace = workspace_id.clone();
+        let second = tokio::spawn(async move {
+            second_core
+                .submit_turn(SubmitTurnRequest {
+                    workspace_id: second_workspace,
+                    source: TurnSource::UserMessage,
+                    input: crate::agent_runtime::AgentInput {
+                        text: "second".into(),
+                        images: Vec::new(),
+                    },
+                    reply_to_channel_message_id: None,
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state.submitted_inputs(),
+            vec!["first".to_string()],
+            "a newer inbound submit must not reach the provider before the older turn completes"
+        );
+
+        state.release_first.notify_one();
+        let first = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first submit task should finish")
+            .expect("first submit task")
+            .expect("first submit");
+        let second = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("second submit task should finish after first completes")
+            .expect("second submit task")
+            .expect("second submit");
+
+        assert_ne!(first.turn_id, second.turn_id);
+        assert_eq!(
+            state.submitted_inputs(),
+            vec!["first".to_string(), "second".to_string()]
         );
     }
 
@@ -7233,10 +7467,12 @@ mod tests {
         let submitted = core
             .submit_turn(SubmitTurnRequest {
                 workspace_id: opened.workspace.workspace_id.clone(),
+                source: TurnSource::UserMessage,
                 input: crate::agent_runtime::AgentInput {
                     text: "please continue".into(),
                     images: Vec::new(),
                 },
+                reply_to_channel_message_id: None,
             })
             .await
             .expect("submit turn");
@@ -7348,10 +7584,12 @@ mod tests {
         let submitted = core
             .submit_turn(SubmitTurnRequest {
                 workspace_id: opened.workspace.workspace_id.clone(),
+                source: TurnSource::UserMessage,
                 input: crate::agent_runtime::AgentInput {
                     text: "please continue".into(),
                     images: Vec::new(),
                 },
+                reply_to_channel_message_id: None,
             })
             .await
             .expect("submit turn");
@@ -7620,10 +7858,12 @@ mod tests {
         let submitted = core
             .submit_turn(SubmitTurnRequest {
                 workspace_id: workspace_id.clone(),
+                source: TurnSource::UserMessage,
                 input: crate::agent_runtime::AgentInput {
                     text: "please continue".into(),
                     images: Vec::new(),
                 },
+                reply_to_channel_message_id: None,
             })
             .await
             .expect("submit turn");
@@ -8475,6 +8715,61 @@ mod tests {
         }
     }
 
+    struct BlockingSubmitState {
+        inputs: StdMutex<Vec<String>>,
+        first_submitted: Notify,
+        release_first: Notify,
+    }
+
+    impl Default for BlockingSubmitState {
+        fn default() -> Self {
+            Self {
+                inputs: StdMutex::new(Vec::new()),
+                first_submitted: Notify::new(),
+                release_first: Notify::new(),
+            }
+        }
+    }
+
+    impl BlockingSubmitState {
+        fn submitted_inputs(&self) -> Vec<String> {
+            self.inputs.lock().expect("submitted inputs lock").clone()
+        }
+    }
+
+    struct BlockingSubmitProvider {
+        state: Arc<BlockingSubmitState>,
+    }
+
+    #[async_trait]
+    impl AgentProvider for BlockingSubmitProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId::from_static("codex")
+        }
+
+        async fn probe(&self) -> Result<ProbeResult, AgentError> {
+            Ok(ProbeResult {
+                provider_id: ProviderId::from_static("codex"),
+                provider_version: Some("test".into()),
+                capabilities: Default::default(),
+            })
+        }
+
+        async fn open(&self, _req: OpenSession) -> Result<Box<dyn AgentSession>, AgentError> {
+            Ok(Box::new(BlockingSubmitSession::new(
+                "blocking-submit-open",
+                Arc::clone(&self.state),
+            )))
+        }
+
+        async fn resume(&self, req: ResumeSession) -> Result<Box<dyn AgentSession>, AgentError> {
+            Ok(Box::new(BlockingSubmitSession::new(
+                req.session_ref.0.as_str(),
+                Arc::clone(&self.state),
+            )))
+        }
+    }
+
     #[derive(Default)]
     struct CompletingProvider {
         next: StdMutex<u64>,
@@ -8523,6 +8818,102 @@ mod tests {
                 tx,
                 events: StdMutex::new(Some(rx)),
             }
+        }
+    }
+
+    struct BlockingSubmitSession {
+        id: SessionId,
+        instance_id: InstanceId,
+        state: Arc<BlockingSubmitState>,
+        tx: tokio::sync::mpsc::Sender<AgentEvent>,
+        events: StdMutex<Option<AgentEventStream>>,
+    }
+
+    impl BlockingSubmitSession {
+        fn new(id: &str, state: Arc<BlockingSubmitState>) -> Self {
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
+            Self {
+                id: SessionId(id.into()),
+                instance_id: InstanceId(format!("instance-{id}").into()),
+                state,
+                tx,
+                events: StdMutex::new(Some(rx)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentSession for BlockingSubmitSession {
+        fn id(&self) -> &SessionId {
+            &self.id
+        }
+
+        fn instance_id(&self) -> &InstanceId {
+            &self.instance_id
+        }
+
+        fn provider_id(&self) -> ProviderId {
+            ProviderId::from_static("codex")
+        }
+
+        async fn submit(&self, input: crate::agent_runtime::AgentInput) -> Result<(), AgentError> {
+            let text = input.text.to_string();
+            self.state
+                .inputs
+                .lock()
+                .expect("submitted inputs lock")
+                .push(text.clone());
+            if text == "first" {
+                self.state.first_submitted.notify_one();
+                self.state.release_first.notified().await;
+            }
+            self.tx
+                .send(AgentEvent::Message(crate::agent_runtime::MessageEvent {
+                    role: crate::agent_runtime::MessageRole::Assistant,
+                    text: format!("reply: {text}").into(),
+                    streaming: false,
+                }))
+                .await
+                .map_err(|err| AgentError {
+                    kind: AgentErrorKind::Internal,
+                    message: err.to_string().into(),
+                })?;
+            self.tx
+                .send(AgentEvent::TurnCompleted(TurnCompletedEvent {
+                    turn_id: format!("provider-turn-{text}").into(),
+                    usage: None,
+                }))
+                .await
+                .map_err(|err| AgentError {
+                    kind: AgentErrorKind::Internal,
+                    message: err.to_string().into(),
+                })?;
+            Ok(())
+        }
+
+        async fn interrupt(&self) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn resolve(
+            &self,
+            _req_id: &str,
+            _response: crate::agent_runtime::InterventionResponse,
+        ) -> Result<(), AgentError> {
+            Ok(())
+        }
+
+        async fn take_events(&self) -> Result<AgentEventStream, AgentError> {
+            Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .take()
+                .expect("events already taken"))
+        }
+
+        async fn close(&self) -> Result<(), AgentError> {
+            Ok(())
         }
     }
 
@@ -8928,10 +9319,12 @@ mod tests {
     async fn submit_noop_turn(core: &LucarneCore, workspace_id: &WorkspaceId) -> SubmittedTurn {
         core.submit_turn(SubmitTurnRequest {
             workspace_id: workspace_id.clone(),
+            source: TurnSource::UserMessage,
             input: crate::agent_runtime::AgentInput {
                 text: "please continue".into(),
                 images: Vec::new(),
             },
+            reply_to_channel_message_id: None,
         })
         .await
         .expect("submit turn")

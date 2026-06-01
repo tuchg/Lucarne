@@ -14,8 +14,7 @@ use lucarne::{
         MessageRole, OpenSession, ProbeResult, ResumeSession, SessionId,
     },
     control_plane::{
-        ControlPlaneSqliteStore, LiveInstanceId, TimelineItem, TimelineItemKind, TurnSource,
-        WorkspaceId,
+        ControlPlaneSqliteStore, TimelineItem, TimelineItemKind, TurnSource, WorkspaceId,
     },
     core_service::{OpenWorkspaceRequest, SubmitTurnRequest},
     LucarneCore, ProviderId,
@@ -103,33 +102,22 @@ async fn exercise_workspace(
         )
         .await
         .map_err(|err| err.to_string())?;
-    let provider_session_id = core
-        .active_provider_session_id(&workspace_id)
-        .map_err(|err| err.to_string())?;
-    let live_instance_id = LiveInstanceId::new(opened.session.instance_id().0.clone());
     let mut events = opened.events;
 
     for turn_idx in 0..turns_per_workspace {
         let input = format!("stress input {workspace_idx}:{turn_idx}");
-        let turn = core
-            .start_turn(
-                workspace_id.clone(),
-                provider_session_id.clone(),
-                live_instance_id.clone(),
-                TurnSource::UserMessage,
-                input.clone(),
-                None,
-            )
+        let submitted = core
+            .submit_turn(SubmitTurnRequest {
+                workspace_id: workspace_id.clone(),
+                source: TurnSource::UserMessage,
+                input: AgentInput {
+                    text: input.into(),
+                    images: Vec::new(),
+                },
+                reply_to_channel_message_id: None,
+            })
+            .await
             .map_err(|err| err.to_string())?;
-        core.submit_turn(SubmitTurnRequest {
-            workspace_id: workspace_id.clone(),
-            input: AgentInput {
-                text: input.into(),
-                images: Vec::new(),
-            },
-        })
-        .await
-        .map_err(|err| err.to_string())?;
 
         let mut saw_assistant = false;
         let mut saw_completed = false;
@@ -142,7 +130,7 @@ async fn exercise_workspace(
                 Event::Message(message) if message.role == MessageRole::Assistant => {
                     core.append_timeline(TimelineItem::new(
                         workspace_id.clone(),
-                        turn.turn_id.clone(),
+                        submitted.turn_id.clone(),
                         TimelineItemKind::Assistant,
                         serde_json::json!({ "text": message.text }),
                     ))
@@ -150,8 +138,6 @@ async fn exercise_workspace(
                     saw_assistant = true;
                 }
                 Event::TurnCompleted(_) => {
-                    core.complete_turn_with_usage_value(turn.turn_id.clone(), None)
-                        .map_err(|err| err.to_string())?;
                     saw_completed = true;
                 }
                 other => return Err(format!("unexpected workspace event: {other:?}")),

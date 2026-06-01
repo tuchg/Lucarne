@@ -18,8 +18,8 @@ use lucarne::{
         Event as AgentEvent, InterventionRequest, MessageRole,
     },
     control_plane::{
-        MessageSessionBinding, ProviderSessionId, StatusSnapshot, TurnId, WorkspaceBinding,
-        WorkspaceId,
+        MessageSessionBinding, ProviderSessionId, StatusSnapshot, TurnId, TurnSource,
+        WorkspaceBinding, WorkspaceId,
     },
     core_service::{
         AgentResourceEntry, AgentResourceScope, AgentResourceSnapshot, CoreEvent, KillAgentReport,
@@ -1650,7 +1650,9 @@ where
             .core
             .submit_turn(SubmitTurnRequest {
                 workspace_id: workspace_id.clone(),
+                source: TurnSource::UserMessage,
                 input,
+                reply_to_channel_message_id: None,
             })
             .await;
         let submitted = match submit {

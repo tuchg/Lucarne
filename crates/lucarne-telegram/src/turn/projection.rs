@@ -56,10 +56,9 @@ pub(super) struct ActiveDraft {
     pub(super) last_render: String,
 }
 
-/// Streaming output for a single turn. The live assistant bubble is a
-/// normal channel message edited in place, then edited one last time
-/// into the final reply. This keeps Telegram from replaying the same
-/// text in a new message when the turn completes.
+/// Streaming output for a single turn. Assistant message chunks update a silent
+/// live preview bubble and track a final candidate. Once the provider emits
+/// `TurnCompleted`, the final candidate is sent as the formal answer.
 pub(super) struct DraftStream {
     pub(super) current: Option<ActiveDraft>,
     /// Latest assistant text candidate to commit as the formal final

@@ -13,7 +13,7 @@ use crate::{
     },
     control_plane::{
         InterventionCallbackToken, LiveInstanceId, ProviderSessionId, Revision, ScheduledTaskId,
-        TurnId, WorkspaceId,
+        TurnId, TurnSource, WorkspaceId,
     },
     history::{HistoryEntry, HistoryWorkspace},
 };
@@ -72,7 +72,9 @@ pub struct ResumeWorkspaceRequest {
 #[derive(Debug, Clone)]
 pub struct SubmitTurnRequest {
     pub workspace_id: WorkspaceId,
+    pub source: TurnSource,
     pub input: AgentInput,
+    pub reply_to_channel_message_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
