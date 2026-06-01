@@ -11449,6 +11449,15 @@ done
                 &notification_topic.chat,
                 &MessageId::new("sent-3"),
             ),
+            None,
+            "deleted silent preview should not route replies"
+        );
+        assert_eq!(
+            bot.state.resolve_message_session_binding(
+                channel.name(),
+                &notification_topic.chat,
+                &MessageId::new("sent-4"),
+            ),
             Some(provider_session_id),
             "final assistant message must route replies"
         );
@@ -11458,7 +11467,7 @@ done
                 message_id: MessageId::new("user-2"),
                 chat: notification_topic.chat.clone(),
                 workspace: Some(notification_topic.workspace.clone()),
-                reply_to: Some(MessageId::new("sent-3")),
+                reply_to: Some(MessageId::new("sent-4")),
                 user: "alice".into(),
                 text: Some("second follow-up".into()),
                 attachments: Vec::new(),

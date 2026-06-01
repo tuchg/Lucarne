@@ -2296,7 +2296,7 @@ mod tests {
             std::mem::take(&mut report.attachments),
         )
         .await;
-        assert_eq!(ids, vec![MessageId::new("2")]);
+        assert_eq!(ids, vec![MessageId::new("3")]);
         assert_eq!(
             *test_channel.attachment_attempts.lock().unwrap(),
             lucarne_channel::robust::ATTACHMENT_DELIVERY_MAX_RETRIES + 1
@@ -3151,10 +3151,15 @@ mod tests {
         let finalized = drafts.finalize(&channel, &target, "pi", None).await;
 
         assert_eq!(finalized.bytes, "下午 1:17".len());
-        let edits = channel.edits.lock().unwrap();
-        let final_edit = &edits.last().expect("final edit").1;
-        assert_eq!(final_edit.body, "下午 1:17");
-        assert_eq!(final_edit.notification, NotificationPolicy::Notify);
+        assert_eq!(finalized.message_ids, vec![MessageId::new("2")]);
+        for (_, msg) in channel.edits.lock().unwrap().iter() {
+            assert_eq!(msg.notification, NotificationPolicy::Silent);
+        }
+        let sends = channel.sends.lock().unwrap();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[1].body, "下午 1:17");
+        assert_eq!(sends[1].notification, NotificationPolicy::Notify);
+        assert_eq!(channel.deletes.lock().unwrap().as_slice(), &["1"]);
     }
 
     #[tokio::test]
@@ -3206,7 +3211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_reply_edits_live_preview_in_place_without_replay() {
+    async fn final_reply_deletes_silent_preview_and_sends_notify_message() {
         let channel = TestChannel::default();
         let target = test_target();
         let mut drafts = DraftStream::new();
@@ -3218,18 +3223,15 @@ mod tests {
         let finalized = drafts.finalize(&channel, &target, "test", None).await;
 
         assert_eq!(finalized.bytes, "这是最终结论".len());
-        assert!(channel.deletes.lock().unwrap().is_empty());
-        assert_eq!(channel.sends.lock().unwrap().len(), 1);
-        assert_eq!(
-            channel.sends.lock().unwrap()[0].notification,
-            NotificationPolicy::Silent
-        );
-        let edits = channel.edits.lock().unwrap();
-        let (id, msg) = edits.last().expect("final reply should edit preview");
-        assert_eq!(id, "1");
-        assert_eq!(msg.body, "这是最终结论");
-        assert_eq!(msg.format, lucarne_channel::TextFormat::Markdown);
-        assert_eq!(msg.notification, NotificationPolicy::Notify);
+        assert_eq!(finalized.message_ids, vec![MessageId::new("2")]);
+        assert_eq!(channel.deletes.lock().unwrap().as_slice(), &["1"]);
+        assert!(channel.edits.lock().unwrap().is_empty());
+        let sends = channel.sends.lock().unwrap();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0].notification, NotificationPolicy::Silent);
+        assert_eq!(sends[1].body, "这是最终结论");
+        assert_eq!(sends[1].format, lucarne_channel::TextFormat::Markdown);
+        assert_eq!(sends[1].notification, NotificationPolicy::Notify);
     }
 
     #[tokio::test]
@@ -3272,7 +3274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_not_modified_edit_does_not_send_duplicate_reply() {
+    async fn final_reply_does_not_depend_on_preview_edit_success() {
         let channel = TestChannel::default();
         channel.edit_errors.lock().unwrap().push(
             "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"
@@ -3288,11 +3290,13 @@ mod tests {
         let finalized = drafts.finalize(&channel, &target, "test", None).await;
 
         assert_eq!(finalized.bytes, "Hello".len());
-        assert_eq!(
-            channel.sends.lock().unwrap().len(),
-            1,
-            "the existing preview already contains the final text"
-        );
+        assert_eq!(finalized.message_ids, vec![MessageId::new("2")]);
+        let sends = channel.sends.lock().unwrap();
+        assert_eq!(sends.len(), 2);
+        assert_eq!(sends[0].notification, NotificationPolicy::Silent);
+        assert_eq!(sends[1].body, "Hello");
+        assert_eq!(sends[1].notification, NotificationPolicy::Notify);
+        assert_eq!(channel.deletes.lock().unwrap().as_slice(), &["1"]);
     }
 
     #[tokio::test]

@@ -186,9 +186,10 @@ impl DraftStream {
         }
     }
 
-    /// Finalize the turn by editing the live reply bubble into the
-    /// formal final reply if one exists. Returns the bytes of the
-    /// committed final reply.
+    /// Finalize the turn by sending a formal final reply if one exists.
+    /// Live preview bubbles are silent drafts; after the final send
+    /// succeeds, the preview is deleted so the final reply is the
+    /// message that may notify the user.
     pub(super) async fn finalize(
         &mut self,
         channel: &dyn Channel,
@@ -196,17 +197,10 @@ impl DraftStream {
         provider_id: &str,
         footer: Option<&AgentMessageFooter>,
     ) -> DraftFinalizeResult {
-        let thought_preview_id = self
-            .current
-            .as_ref()
-            .filter(|current| current.kind == DraftKind::Thought)
-            .and_then(|_| self.fallback_msg_id.clone());
+        let preview_id = self.fallback_msg_id.take();
         self.current.take();
 
         if let Some(msg) = self.final_rich_message.take() {
-            if let Some(id) = thought_preview_id {
-                self.delete_thought_preview(channel, target, &id).await;
-            }
             let msg = self.with_reply(msg);
             let bytes = msg.body.len();
             let mut result = DraftFinalizeResult {
@@ -214,7 +208,12 @@ impl DraftStream {
                 message_ids: Vec::new(),
             };
             match channel.send(target, msg).await {
-                Ok(id) => result.message_ids.push(id),
+                Ok(id) => {
+                    result.message_ids.push(id);
+                    if let Some(preview_id) = preview_id.as_ref() {
+                        delete_preview(channel, target, preview_id).await;
+                    }
+                }
                 Err(e) => {
                     warn!(error = %e, "rich final send failed");
                 }
@@ -223,8 +222,8 @@ impl DraftStream {
         }
 
         let Some(final_text) = self.final_message.take() else {
-            if let Some(id) = thought_preview_id {
-                self.delete_thought_preview(channel, target, &id).await;
+            if let Some(preview_id) = preview_id.as_ref() {
+                delete_preview(channel, target, preview_id).await;
             }
             return DraftFinalizeResult::default();
         };
@@ -245,40 +244,19 @@ impl DraftStream {
             agent_return = %log_event_text(&final_text, EVENT_LOG_TEXT_MAX),
             "sending final assistant reply"
         );
-        if let Some(id) = self.fallback_msg_id.take() {
-            result.message_ids = edit_final_reply(
-                channel,
-                target,
-                &id,
-                provider_id,
-                final_text,
-                self.reply_to.as_ref(),
-            )
-            .await;
-        } else {
-            let msg = self.with_reply(final_reply_message(final_text));
-            match send_with_fallback_all(channel, target, msg, provider_id).await {
-                Ok(ids) => result.message_ids = ids,
-                Err(e) => {
-                    warn!(error = %e, "final send failed");
+        let msg = self.with_reply(final_reply_message(final_text));
+        match send_with_fallback_all(channel, target, msg, provider_id).await {
+            Ok(ids) => {
+                result.message_ids = ids;
+                if let Some(preview_id) = preview_id.as_ref() {
+                    delete_preview(channel, target, preview_id).await;
                 }
+            }
+            Err(e) => {
+                warn!(error = %e, "final send failed");
             }
         }
         result
-    }
-
-    async fn delete_thought_preview(
-        &mut self,
-        channel: &dyn Channel,
-        target: &WorkspaceHandle,
-        id: &MessageId,
-    ) {
-        if self.fallback_msg_id.as_ref() == Some(id) {
-            self.fallback_msg_id.take();
-        }
-        if let Err(e) = channel.delete(target, id).await {
-            warn!(error = %e, "thought preview delete failed");
-        }
     }
 
     fn with_reply(&self, mut msg: OutgoingMessage) -> OutgoingMessage {
@@ -289,79 +267,9 @@ impl DraftStream {
     }
 }
 
-async fn edit_final_reply(
-    channel: &dyn Channel,
-    target: &WorkspaceHandle,
-    id: &MessageId,
-    provider_id: &str,
-    text: String,
-    reply_to: Option<&MessageId>,
-) -> Vec<MessageId> {
-    if text.chars().count() > channel.message_char_limit() {
-        let mut ids = vec![id.clone()];
-        let _ = channel
-            .edit(
-                target,
-                id,
-                OutgoingMessage::plain("Answer too long, sent as follow-up."),
-            )
-            .await;
-        let msg = maybe_reply_to(final_reply_message(text), reply_to);
-        match send_with_fallback_all(channel, target, msg, provider_id).await {
-            Ok(mut fallback_ids) => ids.append(&mut fallback_ids),
-            Err(e) => {
-                warn!(error = %e, "final fallback send failed after oversized edit");
-            }
-        }
-        return ids;
-    }
-
-    let markdown = final_reply_message(text.clone());
-    match channel.edit(target, id, markdown).await {
-        Ok(()) => vec![id.clone()],
-        Err(e) if is_message_not_modified(&e.to_string()) => {
-            debug!(
-                error = %e,
-                "final edit was a no-op; keeping existing streamed reply"
-            );
-            vec![id.clone()]
-        }
-        Err(lucarne_channel::types::ChannelError::FormatRejected(reason)) => {
-            warn!(reason = %reason, "final markdown edit rejected; sending fallback text");
-            let mut ids = vec![id.clone()];
-            let msg = maybe_reply_to(final_reply_message(text), reply_to);
-            match send_with_fallback_all(channel, target, msg, provider_id).await {
-                Ok(mut fallback_ids) => ids.append(&mut fallback_ids),
-                Err(e) => {
-                    warn!(error = %e, "final fallback send failed after markdown edit rejection");
-                }
-            }
-            ids
-        }
-        Err(e) if looks_like_parse_error(&e.to_string()) => {
-            warn!(error = %e, "final markdown edit looked like parse error; sending fallback text");
-            let mut ids = vec![id.clone()];
-            let msg = maybe_reply_to(final_reply_message(text), reply_to);
-            match send_with_fallback_all(channel, target, msg, provider_id).await {
-                Ok(mut fallback_ids) => ids.append(&mut fallback_ids),
-                Err(e) => {
-                    warn!(error = %e, "final fallback send failed after markdown edit parse error");
-                }
-            }
-            ids
-        }
-        Err(e) => {
-            warn!(error = %e, "final edit failed");
-            let mut ids = vec![id.clone()];
-            let msg = maybe_reply_to(final_reply_message(text), reply_to);
-            match send_with_fallback_all(channel, target, msg, provider_id).await {
-                Ok(mut fallback_ids) => ids.append(&mut fallback_ids),
-                Err(e) => {
-                    warn!(error = %e, "final fallback send failed after edit failure");
-                }
-            }
-            ids
-        }
+async fn delete_preview(channel: &dyn Channel, target: &WorkspaceHandle, id: &MessageId) {
+    if let Err(e) = channel.delete(target, id).await {
+        warn!(error = %e, "preview delete failed");
     }
 }
 
@@ -377,18 +285,6 @@ pub(super) fn maybe_reply_to(
         msg.reply_to = reply_to.cloned();
     }
     msg
-}
-
-fn looks_like_parse_error(s: &str) -> bool {
-    let s = s.to_ascii_lowercase();
-    s.contains("parse")
-        || s.contains("entities")
-        || s.contains("markdown")
-        || s.contains("can't parse")
-}
-
-fn is_message_not_modified(s: &str) -> bool {
-    s.to_ascii_lowercase().contains("message is not modified")
 }
 
 fn append_preview_chunk(buf: &mut String, kind: DraftKind, chunk: &str, streaming: bool) {
