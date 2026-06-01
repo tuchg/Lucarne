@@ -301,7 +301,7 @@ impl Channel for TelegramChannel {
             if let Some(t) = thread {
                 req = req.message_thread_id(t);
             }
-            if msg.silent {
+            if msg.notification.is_silent() {
                 req = req.disable_notification(true);
             }
             if idx == 0 {
@@ -491,6 +491,9 @@ impl Channel for TelegramChannel {
         if let Some(cap) = file.caption {
             req = req.caption(cap);
         }
+        if file.notification.is_silent() {
+            req = req.disable_notification(true);
+        }
         if let Some(reply_to) = file.reply_to.as_ref() {
             req = req.reply_parameters(
                 ReplyParameters::new(parse_tg_message_id(reply_to)?).allow_sending_without_reply(),
@@ -528,6 +531,7 @@ impl Channel for TelegramChannel {
             bytes,
             caption,
             reply_to,
+            notification,
         } = attachment;
         let input = InputFile::memory(bytes).file_name(filename);
         let reply_parameters = reply_to
@@ -543,6 +547,9 @@ impl Channel for TelegramChannel {
                 }
                 if let Some(cap) = caption {
                     req = req.caption(cap);
+                }
+                if notification.is_silent() {
+                    req = req.disable_notification(true);
                 }
                 if let Some(reply) = reply_parameters {
                     req = req.reply_parameters(reply);
@@ -561,6 +568,9 @@ impl Channel for TelegramChannel {
                 if let Some(cap) = caption {
                     req = req.caption(cap);
                 }
+                if notification.is_silent() {
+                    req = req.disable_notification(true);
+                }
                 if let Some(reply) = reply_parameters {
                     req = req.reply_parameters(reply);
                 }
@@ -577,6 +587,9 @@ impl Channel for TelegramChannel {
                 }
                 if let Some(cap) = caption {
                     req = req.caption(cap);
+                }
+                if notification.is_silent() {
+                    req = req.disable_notification(true);
                 }
                 if let Some(reply) = reply_parameters {
                     req = req.reply_parameters(reply);

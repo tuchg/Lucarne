@@ -67,6 +67,22 @@ pub struct OutgoingButton {
     pub data: String,
 }
 
+/// Per-message delivery notification intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NotificationPolicy {
+    /// Let the platform alert the user normally.
+    #[default]
+    Notify,
+    /// Deliver without a push/alert where the platform supports it.
+    Silent,
+}
+
+impl NotificationPolicy {
+    pub fn is_silent(self) -> bool {
+        matches!(self, Self::Silent)
+    }
+}
+
 /// A message the bot wants to send. `format` tells the channel how to
 /// render `body` (plain vs markdown). `buttons` is optional inline
 /// keyboard laid out row by row.
@@ -78,9 +94,8 @@ pub struct OutgoingMessage {
     /// If set, the platform should send this message as a reply to
     /// the given source message.
     pub reply_to: Option<MessageId>,
-    /// If true the channel should deliver the message silently (no
-    /// push notification); used for status pings.
-    pub silent: bool,
+    /// Whether this delivery may alert the user.
+    pub notification: NotificationPolicy,
 }
 
 impl OutgoingMessage {
@@ -90,7 +105,7 @@ impl OutgoingMessage {
             format: super::TextFormat::Plain,
             buttons: Vec::new(),
             reply_to: None,
-            silent: false,
+            notification: NotificationPolicy::Notify,
         }
     }
     pub fn markdown(body: impl Into<String>) -> Self {
@@ -99,7 +114,7 @@ impl OutgoingMessage {
             format: super::TextFormat::Markdown,
             buttons: Vec::new(),
             reply_to: None,
-            silent: false,
+            notification: NotificationPolicy::Notify,
         }
     }
     pub fn with_buttons(mut self, rows: Vec<Vec<OutgoingButton>>) -> Self {
@@ -110,8 +125,12 @@ impl OutgoingMessage {
         self.reply_to = Some(id);
         self
     }
+    pub fn with_notification(mut self, notification: NotificationPolicy) -> Self {
+        self.notification = notification;
+        self
+    }
     pub fn silent(mut self) -> Self {
-        self.silent = true;
+        self.notification = NotificationPolicy::Silent;
         self
     }
 }
@@ -125,6 +144,7 @@ pub struct FileUpload {
     pub bytes: Vec<u8>,
     pub caption: Option<String>,
     pub reply_to: Option<MessageId>,
+    pub notification: NotificationPolicy,
 }
 
 impl FileUpload {
@@ -134,6 +154,7 @@ impl FileUpload {
             bytes,
             caption: None,
             reply_to: None,
+            notification: NotificationPolicy::Notify,
         }
     }
     pub fn with_caption(mut self, caption: impl Into<String>) -> Self {
@@ -142,6 +163,14 @@ impl FileUpload {
     }
     pub fn reply_to(mut self, id: MessageId) -> Self {
         self.reply_to = Some(id);
+        self
+    }
+    pub fn with_notification(mut self, notification: NotificationPolicy) -> Self {
+        self.notification = notification;
+        self
+    }
+    pub fn silent(mut self) -> Self {
+        self.notification = NotificationPolicy::Silent;
         self
     }
 }
@@ -154,6 +183,7 @@ pub struct Attachment {
     pub bytes: Vec<u8>,
     pub caption: Option<String>,
     pub reply_to: Option<MessageId>,
+    pub notification: NotificationPolicy,
 }
 
 impl Attachment {
@@ -164,6 +194,7 @@ impl Attachment {
             bytes,
             caption: None,
             reply_to: None,
+            notification: NotificationPolicy::Notify,
         }
     }
     pub fn with_caption(mut self, caption: impl Into<String>) -> Self {
@@ -172,6 +203,14 @@ impl Attachment {
     }
     pub fn reply_to(mut self, id: MessageId) -> Self {
         self.reply_to = Some(id);
+        self
+    }
+    pub fn with_notification(mut self, notification: NotificationPolicy) -> Self {
+        self.notification = notification;
+        self
+    }
+    pub fn silent(mut self) -> Self {
+        self.notification = NotificationPolicy::Silent;
         self
     }
 }

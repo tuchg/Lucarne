@@ -23,8 +23,8 @@ use futures::stream::BoxStream;
 
 pub use types::{
     Attachment, ChannelError, ChannelEvent, ChatId, CommandQuery, CommandQueryResult, FileUpload,
-    IncomingAttachment, IncomingMessage, MessageId, OutgoingButton, OutgoingMessage, Result,
-    WorkspaceHandle, WorkspaceId,
+    IncomingAttachment, IncomingMessage, MessageId, NotificationPolicy, OutgoingButton,
+    OutgoingMessage, Result, WorkspaceHandle, WorkspaceId,
 };
 
 /// Describes how rendered text was produced so a channel impl knows
@@ -134,6 +134,7 @@ pub trait Channel: Send + Sync {
         attachment: Attachment,
     ) -> Result<MessageId> {
         let mut upload = FileUpload::new(attachment.filename, attachment.bytes);
+        upload = upload.with_notification(attachment.notification);
         if let Some(caption) = attachment.caption {
             upload = upload.with_caption(caption);
         }
@@ -237,6 +238,7 @@ mod attachment_tests {
             bytes: vec![1, 2, 3],
             caption: Some("Logo".into()),
             reply_to: Some(MessageId::new("source")),
+            notification: NotificationPolicy::Silent,
         };
 
         let id = channel.send_attachment(&target, attachment).await.unwrap();
@@ -251,5 +253,6 @@ mod attachment_tests {
             files[0].reply_to.as_ref().map(|id| id.as_str()),
             Some("source")
         );
+        assert_eq!(files[0].notification, NotificationPolicy::Silent);
     }
 }

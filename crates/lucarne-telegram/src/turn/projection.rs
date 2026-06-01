@@ -168,7 +168,7 @@ impl DraftStream {
     }
 
     async fn edit_fallback(&mut self, channel: &dyn Channel, target: &WorkspaceHandle, text: &str) {
-        let msg = self.with_reply(OutgoingMessage::markdown(text.to_string()));
+        let msg = self.with_reply(OutgoingMessage::markdown(text.to_string()).silent());
         match self.fallback_msg_id.as_ref() {
             Some(id) => {
                 if let Err(e) = channel.edit(target, id, msg).await {

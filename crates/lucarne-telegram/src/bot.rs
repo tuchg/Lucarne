@@ -5275,7 +5275,9 @@ fn history_upload_from_bytes(
     caption: Option<String>,
     reply_to: MessageId,
 ) -> FileUpload {
-    let mut upload = FileUpload::new(format!("history-image.{ext}"), bytes).reply_to(reply_to);
+    let mut upload = FileUpload::new(format!("history-image.{ext}"), bytes)
+        .reply_to(reply_to)
+        .silent();
     if let Some(caption) = caption.filter(|caption| !caption.trim().is_empty()) {
         upload = upload.with_caption(caption);
     }
@@ -7222,7 +7224,10 @@ mod tests {
         assert_eq!(sent[0].format, lucarne_channel::TextFormat::Markdown);
         assert!(sent[0].body.contains("Lucarne update available"));
         assert!(sent[0].reply_to.is_none());
-        assert!(!sent[0].silent);
+        assert_eq!(
+            sent[0].notification,
+            lucarne_channel::NotificationPolicy::Notify
+        );
         drop(sent);
 
         assert_eq!(

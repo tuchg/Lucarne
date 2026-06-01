@@ -149,7 +149,7 @@ async fn send_with_fallback_inner(
                     format: TextFormat::Plain,
                     buttons: msg.buttons.clone(),
                     reply_to: msg.reply_to.clone(),
-                    silent: msg.silent,
+                    notification: msg.notification,
                 };
                 match channel.send_all(target, plain).await {
                     Ok(ids) => {
@@ -212,7 +212,9 @@ async fn file_fallback(
     let filename = fallback_filename(stem);
     info!(filename = %filename, reason = %reason, "uploading fallback file");
     let caption = format!("↳ inline send failed ({}); see attached.", reason);
-    let mut file = FileUpload::new(filename, msg.body.as_bytes().to_vec()).with_caption(caption);
+    let mut file = FileUpload::new(filename, msg.body.as_bytes().to_vec())
+        .with_caption(caption)
+        .with_notification(msg.notification);
     if let Some(reply_to) = msg.reply_to.clone() {
         file = file.reply_to(reply_to);
     }
@@ -256,7 +258,7 @@ fn fallback_filename(stem: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChatId, WorkspaceId};
+    use crate::types::{ChatId, NotificationPolicy, WorkspaceId};
     use async_trait::async_trait;
     use futures::stream::BoxStream;
     use std::sync::Mutex;
@@ -327,12 +329,14 @@ mod tests {
             .lock()
             .unwrap()
             .push(Err(ChannelError::FormatRejected("bad md".into())));
-        let msg = OutgoingMessage::markdown("# hi");
+        let msg = OutgoingMessage::markdown("# hi").silent();
         let id = send_with_fallback(&ch, &handle(), msg, "reply")
             .await
             .unwrap();
         assert_eq!(id.as_str(), "file");
-        assert!(ch.last_file.lock().unwrap().is_some());
+        let file = ch.last_file.lock().unwrap();
+        let file = file.as_ref().expect("fallback file");
+        assert_eq!(file.notification, NotificationPolicy::Silent);
     }
 
     #[tokio::test]
