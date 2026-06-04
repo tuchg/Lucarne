@@ -1,3 +1,5 @@
+#![allow(clippy::needless_update, clippy::redundant_closure)]
+
 use lucarne::adapter::{
     ArgProfile, Capabilities, Protocol, ProtocolAdapter, ProtocolOptions, ProtocolSessionParts,
     Spec,

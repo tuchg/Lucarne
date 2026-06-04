@@ -1,4 +1,4 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -9,6 +9,9 @@ pub enum Command {
     Paths,
     Doctor,
     Update,
+    /// Launch the interactive full-screen TUI.
+    Tui,
+    Remote(RemoteCommand),
     Autostart(AutostartCommand),
 }
 
@@ -19,6 +22,21 @@ pub enum AutostartCommand {
     Start,
     Stop,
     Status,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteCommand {
+    Start(RemoteCommandOptions),
+    Stop(RemoteCommandOptions),
+    Status(RemoteCommandOptions),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteCommandOptions {
+    pub control_port: Option<u16>,
+    pub json: bool,
+    pub provider: Option<String>,
+    pub fields: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +73,8 @@ fn parse_first(first: OsString, rest: Vec<OsString>) -> Result<Command, ParseErr
         "paths" => require_no_args(Command::Paths, rest),
         "doctor" => require_no_args(Command::Doctor, rest),
         "update" => require_no_args(Command::Update, rest),
+        "tui" => require_no_args(Command::Tui, rest),
+        "remote" => parse_remote(rest),
         "autostart" => parse_autostart(rest),
         other => Err(ParseError::new(format!("unknown command: {other}"))),
     }
@@ -69,6 +89,93 @@ fn require_no_args(command: Command, rest: Vec<OsString>) -> Result<Command, Par
             rest[0].to_string_lossy()
         )))
     }
+}
+
+fn parse_remote(args: Vec<OsString>) -> Result<Command, ParseError> {
+    let mut args = args.into_iter();
+    let Some(subcommand) = args.next() else {
+        return Err(ParseError::new("missing remote subcommand"));
+    };
+    let options = parse_remote_options(args.collect())?;
+    match subcommand.to_string_lossy().as_ref() {
+        "start" => Ok(Command::Remote(RemoteCommand::Start(options))),
+        "stop" => {
+            reject_start_only_remote_options(&options, "stop")?;
+            Ok(Command::Remote(RemoteCommand::Stop(options)))
+        }
+        "status" => {
+            reject_start_only_remote_options(&options, "status")?;
+            Ok(Command::Remote(RemoteCommand::Status(options)))
+        }
+        other => Err(ParseError::new(format!(
+            "unknown remote subcommand: {other}"
+        ))),
+    }
+}
+
+fn parse_remote_options(args: Vec<OsString>) -> Result<RemoteCommandOptions, ParseError> {
+    let mut options = RemoteCommandOptions::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.to_string_lossy().as_ref() {
+            "--json" => options.json = true,
+            "--control-port" => {
+                let Some(port) = iter.next() else {
+                    return Err(ParseError::new("--control-port requires a port"));
+                };
+                options.control_port = Some(parse_control_port(&port)?);
+            }
+            "--provider" => {
+                let Some(provider) = iter.next() else {
+                    return Err(ParseError::new("--provider requires an id"));
+                };
+                let provider = provider.to_string_lossy().trim().to_string();
+                if provider.is_empty() {
+                    return Err(ParseError::new("--provider requires a non-empty id"));
+                }
+                options.provider = Some(provider);
+            }
+            "--field" => {
+                let Some(pair) = iter.next() else {
+                    return Err(ParseError::new("--field requires KEY=VALUE"));
+                };
+                let pair = pair.to_string_lossy();
+                let Some((key, value)) = pair.split_once('=') else {
+                    return Err(ParseError::new("--field requires KEY=VALUE"));
+                };
+                let key = key.trim();
+                if key.is_empty() {
+                    return Err(ParseError::new("--field requires a non-empty key"));
+                }
+                options.fields.insert(key.to_string(), value.to_string());
+            }
+            other => return Err(ParseError::new(format!("unexpected argument: {other}"))),
+        }
+    }
+    Ok(options)
+}
+
+fn parse_control_port(raw: &OsString) -> Result<u16, ParseError> {
+    raw.to_string_lossy()
+        .parse::<u16>()
+        .map_err(|_| ParseError::new(format!("invalid control port: {}", raw.to_string_lossy())))
+}
+
+fn reject_start_only_remote_options(
+    options: &RemoteCommandOptions,
+    subcommand: &str,
+) -> Result<(), ParseError> {
+    if options.provider.is_some() {
+        return Err(ParseError::new(format!(
+            "--provider is only valid for remote start, not remote {subcommand}"
+        )));
+    }
+    if !options.fields.is_empty() {
+        return Err(ParseError::new(format!(
+            "--field is only valid for remote start, not remote {subcommand}"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_autostart(args: Vec<OsString>) -> Result<Command, ParseError> {
@@ -140,6 +247,10 @@ Usage:\n\
   lucarned init                    Configure lucarned interactively\n\
   lucarned doctor                  Diagnose install and runtime state\n\
   lucarned update                  Check latest Lucarne release status\n\
+  lucarned tui                     Launch the interactive terminal dashboard\n\
+  lucarned remote start [--control-port PORT] [--provider ID] [--field KEY=VALUE] [--json]\n\
+  lucarned remote stop [--control-port PORT] [--json]\n\
+  lucarned remote status [--control-port PORT] [--json]\n\
   lucarned paths                   Print resolved paths\n\
   lucarned autostart install [--start] [--bin PATH]\n\
   lucarned autostart uninstall [--stop]\n\
@@ -175,9 +286,47 @@ mod tests {
             parse_words(&["lucarned", "update"]).unwrap(),
             Command::Update
         );
+        assert_eq!(parse_words(&["lucarned", "tui"]).unwrap(), Command::Tui);
+        assert_eq!(
+            parse_words(&["lucarned", "remote", "status"]).unwrap(),
+            Command::Remote(RemoteCommand::Status(RemoteCommandOptions::default()))
+        );
         assert_eq!(
             parse_words(&["lucarned", "--version"]).unwrap(),
             Command::Version
+        );
+    }
+
+    #[test]
+    fn parses_remote_start_options() {
+        let mut fields = BTreeMap::new();
+        fields.insert("token".to_string(), "abc".to_string());
+        fields.insert(
+            "public_url".to_string(),
+            "https://demo.example.test".to_string(),
+        );
+        assert_eq!(
+            parse_words(&[
+                "lucarned",
+                "remote",
+                "start",
+                "--control-port",
+                "7901",
+                "--provider",
+                "cloudflared",
+                "--field",
+                "token=abc",
+                "--field",
+                "public_url=https://demo.example.test",
+                "--json",
+            ])
+            .unwrap(),
+            Command::Remote(RemoteCommand::Start(RemoteCommandOptions {
+                control_port: Some(7901),
+                json: true,
+                provider: Some("cloudflared".to_string()),
+                fields,
+            }))
         );
     }
 
@@ -211,6 +360,7 @@ mod tests {
     #[test]
     fn usage_lists_update_command() {
         assert!(usage().contains("lucarned update"));
+        assert!(usage().contains("lucarned remote start"));
     }
 
     #[test]
@@ -223,5 +373,21 @@ mod tests {
     fn rejects_missing_bin_path() {
         let err = parse_words(&["lucarned", "autostart", "install", "--bin"]).unwrap_err();
         assert_eq!(err.message, "--bin requires a path");
+    }
+
+    #[test]
+    fn rejects_remote_start_only_flags_on_status() {
+        let err = parse_words(&["lucarned", "remote", "status", "--field", "token=x"]).unwrap_err();
+        assert_eq!(
+            err.message,
+            "--field is only valid for remote start, not remote status"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_remote_control_port() {
+        let err =
+            parse_words(&["lucarned", "remote", "stop", "--control-port", "nope"]).unwrap_err();
+        assert_eq!(err.message, "invalid control port: nope");
     }
 }

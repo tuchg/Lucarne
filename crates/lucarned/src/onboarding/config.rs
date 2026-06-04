@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Write},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -194,13 +194,35 @@ pub(crate) fn write_config_with_backup(
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
     ));
-    fs::write(&tmp_path, contents)?;
+    // SEC-001: the config can hold provider secrets (tunnel token), so create the
+    // tmp file owner-only (`0o600`) on unix before writing — the secret is never
+    // briefly group/world-readable. Preserve the atomic tmp+rename below.
+    let mut tmp = owner_only_options()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+    tmp.write_all(contents.as_bytes())?;
+    drop(tmp);
     if let Err(err) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(err.into());
     }
 
     Ok(())
+}
+
+/// An [`OpenOptions`] pre-set to create owner-only (`0o600`) files on unix so the
+/// secret-bearing config (and its backup) is never group/world-readable
+/// (SEC-001). On non-unix there are no mode bits to set, so the platform default
+/// is used.
+fn owner_only_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
 }
 
 fn create_backup(path: &Path, parent: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -212,7 +234,9 @@ fn create_backup(path: &Path, parent: &Path) -> Result<(), Box<dyn std::error::E
     for attempt in 0..1000u16 {
         let timestamp_nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let backup_path = parent.join(format!("{file_name}.bak-{timestamp_nanos}-{attempt}"));
-        match OpenOptions::new()
+        // SEC-001: the backup carries the same provider secrets as the config, so
+        // create it owner-only (`0o600`) on unix too.
+        match owner_only_options()
             .write(true)
             .create_new(true)
             .open(&backup_path)
@@ -611,6 +635,45 @@ channels:
             std::fs::read_to_string(backup_path).expect("read backup"),
             "old-config\n"
         );
+    }
+
+    // SEC-001: the written config (and its backup) holds provider secrets, so on
+    // unix both must be created owner-only (`0o600`) — never group/world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn written_config_and_backup_are_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("lucarned.yaml");
+        std::fs::write(&path, "old-secret\n").expect("write old config");
+
+        write_config_with_backup(&path, "new-secret\n").expect("write config");
+
+        // The replaced config file is 0600.
+        let mode = std::fs::metadata(&path)
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "config must be written owner-only (0600)");
+
+        // The backup of the previous contents is 0600 too.
+        let backup = std::fs::read_dir(temp.path())
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("lucarned.yaml.bak-"))
+            })
+            .expect("backup created");
+        let backup_mode = std::fs::metadata(&backup)
+            .expect("backup metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(backup_mode, 0o600, "backup must be owner-only (0600)");
     }
 
     #[test]

@@ -11,6 +11,22 @@ readme = "../../README.md"
 [features]
 default = []
 memory-profiling = ["lucarne/memory-profiling"]
+remote-access = ["dep:lucarne-remote"]
+terminal-rmux = ["dep:lucarne-rmux"]
+terminal-gateway = [
+    "remote-access",
+    "terminal-rmux",
+    "dep:lucarne-termgw",
+    "lucarne/terminal-agent-bind",
+    "reqwest/blocking",
+]
+tui = [
+    "terminal-gateway",
+    "dep:ratatui",
+    "dep:crossterm",
+    "dep:qrcode",
+]
+product-terminal = ["terminal-gateway", "tui"]
 
 [[bin]]
 name = "lucarned"
@@ -23,6 +39,15 @@ lucarned-ctl = { path = "../lucarned-ctl", features = ["updates"] }
 lucarne-adapter = { path = "../lucarne-adapter" }
 lucarne-telegram = { path = "../lucarne-telegram" }
 lucarne-wechat = { path = "../lucarne-wechat" }
+lucarne-remote = { path = "../lucarne-remote", optional = true }
+lucarne-termgw = { path = "../lucarne-termgw", optional = true }
+lucarne-rmux = { path = "../lucarne-rmux", optional = true }
+axum = { workspace = true }
+# ratatui 0.30 ships the crossterm 0.29 backend by default, so the two stay on
+# one crossterm major.
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
+qrcode = { version = "0.14.1", default-features = false, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
@@ -35,3 +60,6 @@ dotenvy = "0.15"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[package.metadata.dist]
+features = ["product-terminal"]

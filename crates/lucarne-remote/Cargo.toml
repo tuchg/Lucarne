@@ -1,0 +1,23 @@
+[package]
+name = "lucarne-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pluggable remote-access tunnel provider registry (Cloudflared-first)."
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+tokio = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
+url = "2"
+
+[dev-dependencies]
+# SEC-003 binary-pinning tests: create vetted / world-writable temp dirs to
+# exercise `resolve_cloudflared_binary` without a real cloudflared install.
+tempfile = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

@@ -1,3 +1,9 @@
+#![allow(
+    clippy::io_other_error,
+    clippy::needless_borrows_for_generic_args,
+    clippy::unnecessary_get_then_check
+)]
+
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -15,6 +21,8 @@ use lucarne_adapter::{
 use lucarne_telegram::telegram_plugin;
 use lucarne_wechat::wechat_plugin;
 use lucarned_ctl::updates::{UpdateNotice, UpdateRuntime, UpdateStateStore};
+#[cfg(feature = "terminal-gateway")]
+use remote_config::RemoteFileConfig;
 use serde::Deserialize;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -29,11 +37,18 @@ use tracing_subscriber::{
 
 mod health;
 mod onboarding;
+#[cfg(feature = "terminal-gateway")]
+mod remote;
+#[cfg(feature = "terminal-gateway")]
+mod remote_cli;
+#[cfg(feature = "terminal-gateway")]
+mod remote_config;
+#[cfg(feature = "tui")]
+mod tui;
 
 const DEFAULT_LOG_BUFFERED_LINES: usize = 1024;
 const DEFAULT_LOG_MAX_FILES: usize = 16;
 const DEFAULT_HEALTH_ADDR: &str = "127.0.0.1:7766";
-
 const DEFAULT_LUCARNED_CONFIG: &str = r#"agents:
   - claude
   - codex
@@ -55,6 +70,27 @@ logging:
 health:
   enabled: false
   addr: 127.0.0.1:7766
+
+remote:
+  enabled: false
+  provider: cloudflared
+  gateway_addr: 127.0.0.1:7800
+  control_addr: 127.0.0.1:7801
+  auth_token: null
+  readonly_token: null
+  insecure: false
+  # Generic per-provider field maps keyed by provider id (H6c). The selected
+  # `provider` above picks which block is used; the daemon passes the fields
+  # through to the provider verbatim, so a new backend (frp / relay) is just a
+  # new providers.<id> block — no daemon change.
+  providers:
+    cloudflared:
+      token: null
+      public_url: null
+      binary_path: null
+    # Reserved backends (NOT implemented this release — adapter seams only):
+    # frp:   { server_addr: "", token: "" }
+    # relay: { url: "" }
 
 updates:
   enabled: true
@@ -132,9 +168,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         lucarned_ctl::Command::Doctor | lucarned_ctl::Command::Update => {
             run_ctl_network_command(command).await
         }
+        lucarned_ctl::Command::Remote(command) => run_remote_command(command),
+        // The TUI is fully synchronous and uses `reqwest::blocking` for its
+        // loopback control-plane calls. `reqwest::blocking` builds and drops its
+        // own current-thread Tokio runtime; dropping a runtime inside this
+        // `#[tokio::main]` async context panics ("Cannot drop a runtime in a
+        // context where blocking is not allowed"). Run the whole TUI on a
+        // dedicated OS thread with no ambient runtime so the blocking client is
+        // safe. The panic hook installed in `tui::run` is process-global, so a
+        // panic on that thread still restores the terminal.
+        lucarned_ctl::Command::Tui => run_tui_command(),
         command => lucarned_ctl::run(command)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err).into()),
     }
+}
+
+#[cfg(feature = "terminal-gateway")]
+fn run_remote_command(
+    command: lucarned_ctl::RemoteCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::thread::spawn(move || remote_cli::run_remote_command(command))
+        .join()
+        .unwrap_or_else(|_| Err("remote command thread panicked".to_string()))
+        .map_err(|err| -> Box<dyn std::error::Error> {
+            std::io::Error::new(std::io::ErrorKind::Other, err).into()
+        })
+}
+
+#[cfg(not(feature = "terminal-gateway"))]
+fn run_remote_command(
+    _command: lucarned_ctl::RemoteCommand,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("`lucarned remote` requires the `terminal-gateway` Cargo feature".into())
+}
+
+#[cfg(feature = "tui")]
+fn run_tui_command() -> Result<(), Box<dyn std::error::Error>> {
+    std::thread::spawn(tui::run)
+        .join()
+        .unwrap_or_else(|_| Err("tui thread panicked".to_string()))
+        .map_err(|err| -> Box<dyn std::error::Error> {
+            std::io::Error::new(std::io::ErrorKind::Other, err).into()
+        })
+}
+
+#[cfg(not(feature = "tui"))]
+fn run_tui_command() -> Result<(), Box<dyn std::error::Error>> {
+    Err("`lucarned tui` requires the `tui` Cargo feature".into())
 }
 
 async fn run_ctl_network_command(
@@ -173,7 +253,13 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
             ));
     lucarne::memory_profile_snapshot!("lucarned.main.after_register_adapters");
 
-    if enabled_adapter_count == 0 && health_addr.is_none() {
+    // H5 + cold-daemon lazy start: when the terminal gateway product capability
+    // is built, resolve remote config before the idle-exit decision so the
+    // off-tunnel control plane can stay up for `lucarned remote start`.
+    let remote_cfg = remote_config_from_config(&file_config)?;
+    let remote_enabled = remote_cfg.is_some();
+
+    if enabled_adapter_count == 0 && health_addr.is_none() && !remote_enabled {
         lucarne::memory_profile_snapshot!("lucarned.main.no_enabled_adapters");
         info!(
             config_path = ?config_path,
@@ -236,6 +322,41 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         });
         info!(addr = %addr, "lucarned health server started");
     }
+
+    // Remote-access subsystem (Locked decision L6: daemon owns the tunnel
+    // lifecycle). Cold-daemon lazy start: the control plane (port 7801) is served
+    // from boot regardless of `remote.enabled` — `remote_config_from_config` always
+    // resolves to `Some` (resolved BEFORE the idle-exit check — H5). The gateway +
+    // tunnel come up lazily on the first `lucarned remote start`, OR immediately
+    // when `autostart` (`remote.enabled:true`) is set. Wired to the daemon
+    // shutdown signal so a running tunnel is torn down gracefully.
+    #[cfg(feature = "terminal-gateway")]
+    if let Some(remote_cfg) = remote_cfg {
+        match remote::spawn_remote_subsystem(
+            remote_cfg,
+            core.control_plane_store(),
+            shutdown_tx.subscribe(),
+        )
+        .await
+        {
+            Ok(handle) => match handle.public_url {
+                Some(public_url) => info!(
+                    provider = %handle.provider,
+                    public_url = %public_url,
+                    "lucarned remote tunnel started"
+                ),
+                None => info!(
+                    "lucarned remote control plane ready; tunnel idle — run `lucarned remote start` to open public access"
+                ),
+            },
+            Err(err) => {
+                warn!(error = %err, "lucarned remote subsystem failed to start");
+            }
+        }
+    }
+    #[cfg(not(feature = "terminal-gateway"))]
+    let _ = remote_cfg;
+
     info!(
         adapters = adapter_status_reader.snapshot().len(),
         config_path = ?config_path,
@@ -411,6 +532,9 @@ struct LucarnedFileConfig {
     logging: LoggingFileConfig,
     #[serde(default)]
     health: HealthFileConfig,
+    #[cfg(feature = "terminal-gateway")]
+    #[serde(default)]
+    remote: RemoteFileConfig,
     #[serde(default)]
     updates: UpdateFileConfig,
     #[serde(default)]
@@ -671,6 +795,20 @@ fn health_addr_from_config(
     health::parse_health_addr(&addr)
         .map(Some)
         .map_err(Into::into)
+}
+
+#[cfg(feature = "terminal-gateway")]
+fn remote_config_from_config(
+    config: &LucarnedFileConfig,
+) -> Result<Option<remote::RemoteRuntimeConfig>, Box<dyn std::error::Error>> {
+    remote_config::remote_config_from_config(&config.remote)
+}
+
+#[cfg(not(feature = "terminal-gateway"))]
+fn remote_config_from_config(
+    _config: &LucarnedFileConfig,
+) -> Result<Option<()>, Box<dyn std::error::Error>> {
+    Ok(None)
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -1135,6 +1273,27 @@ mod tests {
             .collect::<String>();
 
         assert!(compact_source.contains("#[tokio::main(flavor=\"multi_thread\",worker_threads=2)]"));
+    }
+
+    #[test]
+    fn tui_dispatch_runs_on_a_dedicated_thread_off_the_tokio_runtime() {
+        // Regression guard for the `lucarned tui` startup panic
+        // ("Cannot drop a runtime in a context where blocking is not allowed"):
+        // the TUI uses `reqwest::blocking`, which builds+drops its own runtime,
+        // so it MUST NOT run inside the `#[tokio::main]` async context. The Tui
+        // dispatch arm must hand off to a dedicated OS thread.
+        let source = include_str!("main.rs");
+        let compact_source = source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+
+        assert!(
+            compact_source.contains("Command::Tui=>run_tui_command()")
+                && compact_source.contains("fnrun_tui_command()->Result<(),Box<dynstd::error::Error>>{std::thread::spawn(tui::run)"),
+            "the `Command::Tui` arm must run `tui::run` on a dedicated thread, \
+             not inside the tokio runtime"
+        );
     }
 
     #[test]
@@ -1694,6 +1853,534 @@ health:
         );
     }
 
+    #[cfg(feature = "terminal-gateway")]
+    #[test]
+    fn default_config_parses_including_remote_providers() {
+        // Regression guard: the bootstrapped default config (which writes
+        // remote.providers.cloudflared.{token,public_url,binary_path}: null)
+        // must round-trip through the real parse path.
+        let cfg = LucarnedFileConfig::from_yaml_str(default_lucarned_config().as_ref())
+            .expect("default lucarned config must parse, including remote.providers with nulls");
+        assert_eq!(cfg.remote.enabled, Some(false));
+
+        // Regression guard (live-test bug): YAML `null` provider fields MUST
+        // resolve to ABSENT — never the literal string "null". Otherwise a
+        // quick-tunnel default (token/public_url: null) is misread as a named
+        // tunnel and `cloudflared` validation fails ("invalid public_url").
+        let resolved = remote_config::resolve_provider_fields(&cfg.remote, "cloudflared");
+        assert!(
+            !resolved.contains_key("token"),
+            "null token must be absent, got {:?}",
+            resolved.get("token")
+        );
+        assert!(
+            !resolved.contains_key("public_url"),
+            "null public_url must be absent, got {:?}",
+            resolved.get("public_url")
+        );
+    }
+
+    #[cfg(feature = "terminal-gateway")]
+    #[test]
+    fn remote_file_config_parses_full_section() {
+        // H6c: the generic `providers:` map is the new shape.
+        let config = LucarnedFileConfig::from_yaml_str(
+            r#"
+remote:
+  enabled: true
+  provider: cloudflared
+  gateway_addr: 127.0.0.1:7810
+  control_addr: 127.0.0.1:7811
+  auth_token: secret-token
+  readonly_token: readonly-secret-token
+  insecure: false
+  providers:
+    cloudflared:
+      token: cf-token
+      public_url: https://tunnel.example.com
+      binary_path: /usr/local/bin/cloudflared
+"#,
+        )
+        .expect("parse remote config");
+
+        assert_eq!(config.remote.enabled, Some(true));
+        assert_eq!(config.remote.provider.as_deref(), Some("cloudflared"));
+        assert_eq!(
+            config.remote.gateway_addr.as_deref(),
+            Some("127.0.0.1:7810")
+        );
+        assert_eq!(
+            config.remote.control_addr.as_deref(),
+            Some("127.0.0.1:7811")
+        );
+        assert_eq!(config.remote.auth_token.as_deref(), Some("secret-token"));
+        assert_eq!(
+            config.remote.readonly_token.as_deref(),
+            Some("readonly-secret-token")
+        );
+        assert_eq!(config.remote.insecure, Some(false));
+        let cf = config
+            .remote
+            .providers
+            .get("cloudflared")
+            .expect("cloudflared provider block");
+        assert_eq!(cf.get("token").and_then(|v| v.as_deref()), Some("cf-token"));
+        assert_eq!(
+            cf.get("public_url").and_then(|v| v.as_deref()),
+            Some("https://tunnel.example.com")
+        );
+        assert_eq!(
+            cf.get("binary_path").and_then(|v| v.as_deref()),
+            Some("/usr/local/bin/cloudflared")
+        );
+        // resolve_provider_fields surfaces the concrete values for the provider.
+        let resolved = remote_config::resolve_provider_fields(&config.remote, "cloudflared");
+        assert_eq!(resolved.get("token").map(String::as_str), Some("cf-token"));
+        assert_eq!(
+            resolved.get("public_url").map(String::as_str),
+            Some("https://tunnel.example.com")
+        );
+
+        // Back-compat: the legacy provider-owned `cloudflare:` compat section
+        // still parses without daemon-owned concrete provider structs (H6c).
+        let legacy = LucarnedFileConfig::from_yaml_str(
+            r#"
+remote:
+  enabled: true
+  cloudflare:
+    token: legacy-token
+    public_url: https://legacy.example.com
+"#,
+        )
+        .expect("parse legacy remote config");
+        assert_eq!(
+            legacy
+                .remote
+                .extra_sections
+                .get("cloudflare")
+                .and_then(|section| section.get("token"))
+                .and_then(serde_json::Value::as_str),
+            Some("legacy-token")
+        );
+        assert_eq!(
+            legacy
+                .remote
+                .extra_sections
+                .get("cloudflare")
+                .and_then(|section| section.get("public_url"))
+                .and_then(serde_json::Value::as_str),
+            Some("https://legacy.example.com")
+        );
+
+        // Missing section → all-None defaults (serde(default)), like health.
+        let missing =
+            LucarnedFileConfig::from_yaml_str("channels: {}\n").expect("parse missing remote");
+        assert_eq!(missing.remote.enabled, None);
+        assert_eq!(missing.remote.provider, None);
+        assert_eq!(missing.remote.control_addr, None);
+        assert!(missing.remote.providers.is_empty());
+        assert!(!missing.remote.extra_sections.contains_key("cloudflare"));
+    }
+
+    // H6c: the generic provider_fields map is resolved with provider-declared
+    // compat sections merged first and `providers.<id>` merged over them. The
+    // daemon never interprets a provider-specific field name.
+    #[cfg(feature = "terminal-gateway")]
+    #[test]
+    fn remote_config_resolves_generic_provider_fields() {
+        with_env(
+            &[
+                ("LUCARNED_REMOTE_ENABLED", None),
+                ("LUCARNED_REMOTE_PROVIDER", None),
+                ("LUCARNED_REMOTE_GATEWAY_ADDR", None),
+                ("LUCARNED_REMOTE_CONTROL_ADDR", None),
+                ("LUCARNED_REMOTE_AUTH_TOKEN", None),
+            ],
+            || {
+                // Generic providers map alone → fields pass through verbatim.
+                let generic = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  provider: cloudflared
+  providers:
+    cloudflared:
+      token: gen-token
+      public_url: https://gen.example.com
+"#,
+                )
+                .expect("parse generic remote config");
+                let resolved = remote_config_from_config(&generic)
+                    .expect("generic remote config")
+                    .expect("enabled → Some");
+                assert_eq!(
+                    resolved.provider_fields.get("token").map(String::as_str),
+                    Some("gen-token")
+                );
+                assert_eq!(
+                    resolved
+                        .provider_fields
+                        .get("public_url")
+                        .map(String::as_str),
+                    Some("https://gen.example.com")
+                );
+
+                // Legacy cloudflare block alone → still resolved (back-compat).
+                let legacy = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  cloudflare:
+    token: legacy-token
+    binary_path: /usr/local/bin/cloudflared
+"#,
+                )
+                .expect("parse legacy remote config");
+                let resolved = remote_config_from_config(&legacy)
+                    .expect("legacy remote config")
+                    .expect("enabled → Some");
+                assert_eq!(
+                    resolved.provider_fields.get("token").map(String::as_str),
+                    Some("legacy-token")
+                );
+                assert_eq!(
+                    resolved
+                        .provider_fields
+                        .get("binary_path")
+                        .map(String::as_str),
+                    Some("/usr/local/bin/cloudflared")
+                );
+
+                // Both set → providers.<id> wins over the legacy block per key.
+                let both = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  cloudflare:
+    token: legacy-token
+    binary_path: /legacy/cloudflared
+  providers:
+    cloudflared:
+      token: generic-token
+"#,
+                )
+                .expect("parse merged remote config");
+                let resolved = remote_config_from_config(&both)
+                    .expect("merged remote config")
+                    .expect("enabled → Some");
+                // providers.cloudflared.token overrides the legacy token.
+                assert_eq!(
+                    resolved.provider_fields.get("token").map(String::as_str),
+                    Some("generic-token")
+                );
+                // A legacy-only key with no generic override is preserved.
+                assert_eq!(
+                    resolved
+                        .provider_fields
+                        .get("binary_path")
+                        .map(String::as_str),
+                    Some("/legacy/cloudflared")
+                );
+
+                // A non-cloudflared provider ignores the legacy cloudflare block.
+                let other = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  provider: frp
+  cloudflare:
+    token: should-be-ignored
+  providers:
+    frp:
+      server_addr: relay.example.com
+"#,
+                )
+                .expect("parse other-provider config");
+                let resolved = remote_config_from_config(&other)
+                    .expect("other-provider remote config")
+                    .expect("enabled → Some");
+                assert_eq!(resolved.provider, "frp");
+                assert!(
+                    resolved.provider_fields.get("token").is_none(),
+                    "legacy cloudflare block must not bleed into a non-cloudflared provider"
+                );
+                assert_eq!(
+                    resolved
+                        .provider_fields
+                        .get("server_addr")
+                        .map(String::as_str),
+                    Some("relay.example.com")
+                );
+            },
+        );
+    }
+    #[cfg(feature = "terminal-gateway")]
+    #[test]
+    fn remote_config_requires_enabled_gate_and_honors_env() {
+        // Cold-daemon lazy start: lucarned ALWAYS resolves to `Some` (the
+        // control plane is served from boot); `remote.enabled` now drives
+        // `autostart`, not whether the subsystem exists.
+        with_env(
+            &[
+                ("LUCARNED_REMOTE_ENABLED", None),
+                ("LUCARNED_REMOTE_PROVIDER", None),
+                ("LUCARNED_REMOTE_GATEWAY_ADDR", None),
+                ("LUCARNED_REMOTE_CONTROL_ADDR", None),
+                ("LUCARNED_REMOTE_AUTH_TOKEN", None),
+                ("LUCARNED_REMOTE_INSECURE", None),
+            ],
+            || {
+                // Default (no remote section) → still Some, with autostart=false
+                // (the control plane is up but the tunnel stays idle).
+                let default_config = LucarnedFileConfig::default();
+                let resolved = remote_config_from_config(&default_config)
+                    .expect("default remote config")
+                    .expect("lucarned always resolves to Some (lazy start)");
+                assert!(
+                    !resolved.autostart,
+                    "remote disabled (default) → control plane ready, tunnel idle (autostart=false)"
+                );
+                // The control info is still resolved so `lucarned remote start` works.
+                assert_eq!(
+                    resolved.control_addr,
+                    remote_config::DEFAULT_REMOTE_CONTROL_ADDR.parse().unwrap()
+                );
+
+                // Enabled in file, defaults fill provider + loopback gateway addr
+                // + the distinct off-tunnel control addr (SEC-002), and autostart
+                // is true.
+                let enabled = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+"#,
+                )
+                .expect("parse enabled remote config");
+                let resolved = remote_config_from_config(&enabled)
+                    .expect("enabled remote config")
+                    .expect("enabled → Some");
+                assert!(resolved.autostart, "remote.enabled:true → autostart=true");
+                assert_eq!(resolved.provider, remote_config::DEFAULT_REMOTE_PROVIDER);
+                assert_eq!(
+                    resolved.gateway_addr,
+                    remote_config::DEFAULT_REMOTE_GATEWAY_ADDR.parse().unwrap()
+                );
+                assert_eq!(
+                    resolved.control_addr,
+                    remote_config::DEFAULT_REMOTE_CONTROL_ADDR.parse().unwrap()
+                );
+                // SEC-002: control plane must be on a DISTINCT port from the gateway.
+                assert_ne!(resolved.control_addr.port(), resolved.gateway_addr.port());
+                assert!(resolved.auth_token.is_none());
+                assert!(!resolved.insecure);
+            },
+        );
+
+        // Env overrides win over file values (and can enable autostart even when
+        // the file disables it).
+        with_env(
+            &[
+                ("LUCARNED_REMOTE_ENABLED", Some("true")),
+                ("LUCARNED_REMOTE_PROVIDER", Some("cloudflared")),
+                ("LUCARNED_REMOTE_GATEWAY_ADDR", Some("127.0.0.1:7900")),
+                ("LUCARNED_REMOTE_CONTROL_ADDR", None),
+                (
+                    "LUCARNED_REMOTE_AUTH_TOKEN",
+                    Some("env-token-0123456789abcdef0123456789"),
+                ),
+                ("LUCARNED_REMOTE_INSECURE", Some("true")),
+            ],
+            || {
+                let disabled_file = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: false
+  gateway_addr: 127.0.0.1:7810
+"#,
+                )
+                .expect("parse remote config");
+                let resolved = remote_config_from_config(&disabled_file)
+                    .expect("env-enabled remote config")
+                    .expect("env enabled → Some");
+                assert!(
+                    resolved.autostart,
+                    "LUCARNED_REMOTE_ENABLED=true overrides remote.enabled:false → autostart=true"
+                );
+                assert_eq!(resolved.gateway_addr, "127.0.0.1:7900".parse().unwrap());
+                // No control addr configured → derived as gateway port + 1.
+                assert_eq!(resolved.control_addr, "127.0.0.1:7901".parse().unwrap());
+                assert_eq!(
+                    resolved.auth_token.as_deref(),
+                    Some("env-token-0123456789abcdef0123456789")
+                );
+                assert!(resolved.insecure);
+            },
+        );
+    }
+
+    // SEC-002: a control_addr sharing the gateway port is rejected (it would
+    // re-expose the control plane on the tunnel).
+    #[cfg(feature = "terminal-gateway")]
+    #[test]
+    fn remote_config_rejects_control_addr_sharing_gateway_port() {
+        with_env(
+            &[
+                ("LUCARNED_REMOTE_ENABLED", None),
+                ("LUCARNED_REMOTE_GATEWAY_ADDR", None),
+                ("LUCARNED_REMOTE_CONTROL_ADDR", None),
+                ("LUCARNED_REMOTE_AUTH_TOKEN", None),
+            ],
+            || {
+                let same_port = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  gateway_addr: 127.0.0.1:7800
+  control_addr: 127.0.0.1:7800
+"#,
+                )
+                .expect("parse shared-port remote config");
+                assert!(
+                    remote_config_from_config(&same_port).is_err(),
+                    "control plane sharing the gateway port must be rejected"
+                );
+            },
+        );
+    }
+
+    // SEC-008: a weak explicit auth_token (whitespace / too short) fails closed
+    // at config resolution.
+    #[cfg(feature = "terminal-gateway")]
+    #[test]
+    fn remote_config_rejects_weak_auth_token() {
+        with_env(
+            &[
+                ("LUCARNED_REMOTE_ENABLED", None),
+                ("LUCARNED_REMOTE_GATEWAY_ADDR", None),
+                ("LUCARNED_REMOTE_CONTROL_ADDR", None),
+                ("LUCARNED_REMOTE_AUTH_TOKEN", None),
+            ],
+            || {
+                let short = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  auth_token: "abc123"
+"#,
+                )
+                .expect("parse short-token remote config");
+                assert!(
+                    remote_config_from_config(&short).is_err(),
+                    "a <32-char auth_token must be rejected (SEC-008)"
+                );
+
+                // A strong token (≥32 chars) is accepted.
+                let strong = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  auth_token: "0123456789abcdef0123456789abcdef"
+"#,
+                )
+                .expect("parse strong-token remote config");
+                let resolved = remote_config_from_config(&strong)
+                    .expect("strong token accepted")
+                    .expect("enabled → Some");
+                assert_eq!(
+                    resolved.auth_token.as_deref(),
+                    Some("0123456789abcdef0123456789abcdef")
+                );
+            },
+        );
+    }
+
+    // SEC-013: a read-only token is resolved when set and validated like the
+    // full token (weak ⇒ rejected). Absent ⇒ no read-only tier.
+    #[cfg(feature = "terminal-gateway")]
+    #[test]
+    fn remote_config_resolves_and_validates_readonly_token() {
+        with_env(
+            &[
+                ("LUCARNED_REMOTE_ENABLED", None),
+                ("LUCARNED_REMOTE_GATEWAY_ADDR", None),
+                ("LUCARNED_REMOTE_CONTROL_ADDR", None),
+                ("LUCARNED_REMOTE_AUTH_TOKEN", None),
+                ("LUCARNED_REMOTE_READONLY_TOKEN", None),
+            ],
+            || {
+                // No readonly token configured → None (no read-only tier).
+                let none = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+"#,
+                )
+                .expect("parse remote config");
+                let resolved = remote_config_from_config(&none)
+                    .expect("enabled remote config")
+                    .expect("enabled → Some");
+                assert!(resolved.readonly_token.is_none());
+
+                // A strong readonly token (≥32 chars) is accepted and surfaced.
+                let strong = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  auth_token: "0123456789abcdef0123456789abcdef"
+  readonly_token: "readonly-0123456789abcdef0123456789"
+"#,
+                )
+                .expect("parse strong-readonly remote config");
+                let resolved = remote_config_from_config(&strong)
+                    .expect("strong readonly accepted")
+                    .expect("enabled → Some");
+                assert_eq!(
+                    resolved.readonly_token.as_deref(),
+                    Some("readonly-0123456789abcdef0123456789")
+                );
+
+                // A weak readonly token (<32 chars) is rejected (fail-closed).
+                let weak = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  auth_token: "0123456789abcdef0123456789abcdef"
+  readonly_token: "short"
+"#,
+                )
+                .expect("parse weak-readonly remote config");
+                assert!(
+                    remote_config_from_config(&weak).is_err(),
+                    "a <32-char readonly_token must be rejected (SEC-008/SEC-013)"
+                );
+            },
+        );
+    }
+    #[cfg(feature = "terminal-gateway")]
+    #[test]
+    fn remote_config_rejects_non_loopback_gateway_addr() {
+        with_env(
+            &[
+                ("LUCARNED_REMOTE_ENABLED", None),
+                ("LUCARNED_REMOTE_GATEWAY_ADDR", None),
+                ("LUCARNED_REMOTE_CONTROL_ADDR", None),
+                ("LUCARNED_REMOTE_AUTH_TOKEN", None),
+            ],
+            || {
+                let public = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+  gateway_addr: 0.0.0.0:7800
+"#,
+                )
+                .expect("parse public-bind remote config");
+                // Loopback hardening (L3): a non-loopback gateway bind is refused.
+                assert!(remote_config_from_config(&public).is_err());
+            },
+        );
+    }
+
     #[test]
     fn log_filter_defaults_stderr_to_warn() {
         with_env(&[("RUST_LOG", None), ("LUCARNE_STDERR_LOG", None)], || {
@@ -1802,8 +2489,87 @@ logging:
             .expect("http client creation");
 
         assert!(run_daemon_source.contains("enabled_adapter_count == 0 && health_addr.is_none()"));
+        // H5: the idle-exit must also account for an enabled remote subsystem so
+        // a "remote only" config does not early-exit before the tunnel starts.
+        assert!(run_daemon_source.contains("&& !remote_enabled"));
         assert!(idle_exit < open_core);
         assert!(idle_exit < http_client);
+    }
+
+    // H5 + cold-daemon lazy start: when the terminal gateway product capability
+    // is built, remote config is resolved BEFORE the idle-exit decision and
+    // resolves to `Some` so the control plane is served from boot and the daemon
+    // does NOT idle-exit.
+    #[cfg(feature = "terminal-gateway")]
+    #[test]
+    fn remote_only_config_keeps_daemon_from_idle_exit() {
+        // Source-level: remote_cfg is resolved before the idle-exit guidance log.
+        let source = include_str!("main.rs");
+        let production_source = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let run_daemon_source = production_source
+            .split("async fn run_daemon()")
+            .nth(1)
+            .and_then(|rest| rest.split("fn init_tracing").next())
+            .expect("run_daemon body");
+        let resolve = run_daemon_source
+            .find("remote_config_from_config(&file_config)")
+            .expect("remote config resolved in run_daemon");
+        let idle_exit = run_daemon_source
+            .find("no adapters enabled; edit lucarned config to enable a channel")
+            .expect("idle exit guidance log");
+        assert!(
+            resolve < idle_exit,
+            "remote config must be resolved before the idle-exit decision (H5)"
+        );
+
+        // Behavioral: even a remote-disabled config (no health, no channels)
+        // resolves to Some in lucarned (cold-daemon lazy start: the control
+        // plane is served from boot) → remote_enabled true → no idle exit.
+        with_env(
+            &[
+                ("LUCARNED_REMOTE_ENABLED", None),
+                ("LUCARNED_REMOTE_GATEWAY_ADDR", None),
+                ("LUCARNED_REMOTE_CONTROL_ADDR", None),
+                ("LUCARNED_REMOTE_AUTH_TOKEN", None),
+                ("LUCARNED_HEALTH_ENABLED", None),
+            ],
+            || {
+                let remote_only = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: true
+"#,
+                )
+                .expect("parse remote-only config");
+                // No health enabled.
+                assert!(health_addr_from_config(&remote_only)
+                    .expect("health addr")
+                    .is_none());
+                // Remote autostart on → Some → the idle-exit guard's
+                // `!remote_enabled` is false, so the daemon stays up.
+                assert!(remote_config_from_config(&remote_only)
+                    .expect("remote config")
+                    .is_some());
+
+                // Cold daemon (remote disabled): STILL resolves to Some so the
+                // control plane is up and `lucarned remote start` can reach it — the
+                // daemon must not idle-exit even with the tunnel idle.
+                let cold = LucarnedFileConfig::from_yaml_str(
+                    r#"
+remote:
+  enabled: false
+"#,
+                )
+                .expect("parse cold remote config");
+                let resolved = remote_config_from_config(&cold)
+                    .expect("cold remote config")
+                    .expect("lucarned resolves to Some even when disabled");
+                assert!(
+                    !resolved.autostart,
+                    "remote.enabled:false → control plane ready, tunnel idle"
+                );
+            },
+        );
     }
 
     #[test]

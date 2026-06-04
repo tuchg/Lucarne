@@ -68,7 +68,6 @@ pub fn fixture_path(subdir: &str, name: &str) -> PathBuf {
 /// `cat`s `fixture` to stdout. Used as a stand-in binary for adapters
 /// whose fixtures are raw JSONL (copilot, pi) rather than fakeagent
 /// directive scripts.
-
 pub fn write_cat_script(fixture: &std::path::Path) -> PathBuf {
     let dir = tempfile::tempdir().expect("tempdir");
     #[cfg(unix)]
@@ -94,7 +93,6 @@ pub fn write_cat_script(fixture: &std::path::Path) -> PathBuf {
 }
 
 /// Write a script that handles `pi --list-models` and otherwise cats the fixture.
-
 pub fn write_pi_cat_script(fixture: &std::path::Path) -> PathBuf {
     let dir = tempfile::tempdir().expect("tempdir");
     #[cfg(unix)]

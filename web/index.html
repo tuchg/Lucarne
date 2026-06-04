@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lucarne · workbench</title>
+    <style>
+      :root { --bg:#101014; --fg:#d8d8d8; --panel:#16161c; --line:#26262e; --accent:#4e9a06; --muted:#8a8a96; }
+      * { box-sizing: border-box; }
+      html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:13px "SF Mono", Menlo, Consolas, monospace; }
+      #shell { display:flex; flex-direction:column; height:100vh; }
+      #tabs { display:flex; gap:2px; background:var(--panel); border-bottom:1px solid var(--line); padding:6px 8px; align-items:center; }
+      #tabs button { background:transparent; color:var(--muted); border:0; padding:5px 12px; border-radius:5px; cursor:pointer; font:inherit; }
+      #tabs button.active { background:#2a2a36; color:var(--fg); }
+      #tabs .spacer { flex:1; }
+      #tabs .conn { color:var(--muted); font-size:12px; }
+      #views { flex:1; min-height:0; }
+      .view { display:none; height:100%; }
+      .view.active { display:flex; }
+
+      /* terminal view: sessions | terminal | file tree */
+      #term-side { flex:0 0 220px; background:var(--panel); border-right:1px solid var(--line); display:flex; flex-direction:column; min-height:0; }
+      #term-side header { padding:9px 12px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; }
+      #new-session { background:var(--accent); color:#fff; border:0; border-radius:4px; padding:3px 8px; cursor:pointer; font:inherit; }
+      ul#sessions { list-style:none; margin:0; padding:6px; overflow:auto; flex:1; }
+      ul#sessions li { padding:6px 8px; border-radius:4px; cursor:pointer; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      ul#sessions li:hover { background:#1f1f27; }
+      ul#sessions li.active { background:#2a2a36; }
+      ul#sessions li .cwd { display:block; color:var(--muted); font-size:11px; overflow:hidden; text-overflow:ellipsis; }
+      ul#sessions li .badge { color:var(--muted); }
+
+      #term-main { flex:1; min-width:0; display:flex; flex-direction:column; }
+      #term-toolbar { display:flex; gap:6px; align-items:center; padding:5px 8px; border-bottom:1px solid var(--line); background:var(--panel); flex-wrap:wrap; }
+      #term-toolbar button { background:#22222c; color:var(--fg); border:0; border-radius:4px; padding:3px 9px; cursor:pointer; font:inherit; }
+      #term-status { color:var(--muted); font-size:12px; margin-left:6px; }
+      .agentbtn { background:#2a3a4a; color:var(--fg); border:0; border-radius:4px; padding:2px 8px; margin-left:8px; cursor:pointer; font:inherit; }
+      #screenwrap { flex:1; overflow:auto; padding:10px; }
+      #screen { outline:none; display:block; }
+
+      #filetree-panel { flex:0 0 290px; background:var(--panel); border-left:1px solid var(--line); display:flex; flex-direction:column; min-height:0; transition:flex-basis .12s; }
+      #filetree-panel.collapsed { flex-basis:34px; }
+      #filetree-panel header { padding:9px 10px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; }
+      #ft-collapse { background:transparent; color:var(--muted); border:0; cursor:pointer; font:inherit; }
+      #filetree-panel.collapsed #filetree, #filetree-panel.collapsed #ft-title { display:none; }
+      #filetree { flex:1; overflow:auto; padding:4px 6px; }
+      ul.tree { list-style:none; margin:0; padding-left:13px; }
+      #filetree > ul.tree { padding-left:2px; }
+      .tnode { padding:1px 4px; border-radius:3px; cursor:default; white-space:nowrap; }
+      .tnode.file { cursor:grab; }
+      .tnode:hover { background:#1f1f27; }
+
+      /* chat view */
+      #chat-view { flex-direction:column; }
+      #chat-bar { display:flex; gap:8px; align-items:center; padding:6px 10px; border-bottom:1px solid var(--line); background:var(--panel); }
+      #chat-new { background:var(--accent); color:#fff; border:0; border-radius:5px; padding:4px 10px; cursor:pointer; font:inherit; }
+      #chat-picker { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:5px; padding:4px 6px; font:inherit; max-width:380px; }
+      #chat-source { color:var(--muted); font-size:12px; }
+      #chat-log { flex:1; overflow:auto; padding:16px; display:flex; flex-direction:column; gap:10px; }
+      .bubble { max-width:760px; padding:8px 12px; border-radius:10px; white-space:pre-wrap; word-break:break-word; line-height:1.5; }
+      .bubble.user { align-self:flex-end; background:#2a3a4a; }
+      .bubble.assistant { align-self:flex-start; background:#1f1f27; }
+      .bubble.meta { align-self:center; color:var(--muted); font-size:12px; background:transparent; padding:2px; }
+      .bubble.reasoning { align-self:flex-start; background:#181820; color:var(--muted); font-style:italic; }
+      .bubble p { margin:4px 0; }
+      .bubble pre { background:#0c0c10; border:1px solid var(--line); border-radius:6px; padding:8px; overflow:auto; margin:6px 0; }
+      .bubble code { background:#0c0c10; border-radius:3px; padding:1px 4px; }
+      .bubble pre code { background:transparent; padding:0; }
+      .bubble h1,.bubble h2,.bubble h3,.bubble h4 { margin:6px 0 3px; }
+      .bubble ul { margin:4px 0; padding-left:20px; }
+      .bubble a { color:#79b8ff; }
+      .bubble .approve { margin-top:6px; display:flex; gap:8px; }
+      .bubble .approve button { border:0; border-radius:4px; padding:3px 10px; cursor:pointer; font:inherit; }
+      .approve .allow { background:var(--accent); color:#fff; }
+      .approve .deny { background:#cc3333; color:#fff; }
+      #chat-input-row { display:flex; gap:8px; border-top:1px solid var(--line); padding:10px; background:var(--panel); }
+      #chat-input { flex:1; resize:none; background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:8px; font:inherit; }
+      #chat-input:disabled { opacity:.5; }
+      #chat-send { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:0 16px; cursor:pointer; font:inherit; }
+    </style>
+  </head>
+  <body>
+    <div id="shell">
+      <div id="tabs">
+        <button id="tab-terminal" class="active">Terminal</button>
+        <button id="tab-chat">Chat</button>
+        <span class="spacer"></span>
+        <span class="conn" id="conn">connecting…</span>
+      </div>
+      <div id="views">
+        <section id="terminal-view" class="view active">
+          <aside id="term-side">
+            <header><b>Sessions</b><button id="new-session">+ New</button></header>
+            <ul id="sessions"></ul>
+          </aside>
+          <div id="term-main">
+            <div id="term-toolbar">
+              <button id="zoom-out" title="zoom out">A−</button>
+              <button id="zoom-in" title="zoom in">A+</button>
+              <button id="zoom-fit" title="fit width">Fit</button>
+              <span id="term-status">connecting…</span>
+            </div>
+            <div id="screenwrap"><canvas id="screen" tabindex="0"></canvas></div>
+          </div>
+          <aside id="filetree-panel">
+            <header><b id="ft-title">Files · pane cwd</b><button id="ft-collapse" title="collapse">⮞</button></header>
+            <div id="filetree"></div>
+          </aside>
+        </section>
+        <section id="chat-view" class="view">
+          <div id="chat-bar">
+            <button id="chat-new">➕ New agent</button>
+            <select id="chat-picker" title="bound terminal agents + recent history"></select>
+            <span id="chat-source">managed agent (new session)</span>
+          </div>
+          <div id="chat-log"></div>
+          <div id="chat-input-row">
+            <textarea id="chat-input" rows="2" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)"></textarea>
+            <button id="chat-send">Send</button>
+          </div>
+        </section>
+      </div>
+    </div>
+    <script type="module" src="./js/app.js"></script>
+  </body>
+</html>

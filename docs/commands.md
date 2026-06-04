@@ -56,3 +56,75 @@
 | `/config` | 查看当前 bypass、notifications 状态 |
 | `/config global notifications on\|off` | 开关全局通知 |
 | `/config global bypass on\|off` | 开关全局权限绕过 |
+
+## 终端控制台（`lucarned tui`）
+
+`lucarned tui` 是本地操作者的唯一交互入口（替代旧的 `term` CLI）：
+
+> 完整说明（面板、键位、Go Public 的守护进程依赖、`term` → `lucarned tui` 迁移）见 [`docs/tui.md`](tui.md)。
+
+```bash
+lucarned tui
+```
+
+全局键位：
+
+| 键位 | 用途 |
+|---|---|
+| `↑` / `↓` | 在当前面板内上下移动选项 |
+| `Tab` / `←` / `→` | 在 Sessions / Go Public / Config 三个面板间切换 |
+| `r` | 刷新当前面板 |
+| `q` / `Esc` | 关闭模态（如打开）/ 退出控制台 |
+| `Ctrl-C` | 强制退出 |
+
+### Sessions 面板（rmux 会话）
+
+| 键位 | 用途 |
+|---|---|
+| `Enter` | attach：把会话弹出到本地终端，detach 后回到控制台 |
+| `d` | detach 当前客户端（远程镜像继续运行） |
+| `k` / `Del` | kill 选中会话 |
+| `a` | archive 选中会话到共享 archive store |
+| `r` | 刷新会话列表 |
+
+### Go Public 面板（远程接入）
+
+| 键位 | 用途 |
+|---|---|
+| `s` | 启动远程接入隧道（`/api/remote/start`） |
+| `x` | 停止隧道（`/api/remote/stop`） |
+| `r` | 查询状态（`/api/remote/status`） |
+| `Enter` | 弹出登录 URL 的高对比二维码模态（终端过小时回退为纯 URL） |
+| `Esc` / `q` / `Enter` | 关闭二维码模态 |
+
+## Headless 远程接入（`lucarned remote`）
+
+`lucarned remote` 是 TUI Go Public 面板的脚本化对等入口。它只调用 daemon 的
+loopback control plane，不直接拥有隧道生命周期；daemon 必须正在运行。
+
+```bash
+lucarned remote start
+lucarned remote start --provider cloudflared --field token=... --field public_url=https://...
+lucarned remote status --json
+lucarned remote stop
+```
+
+| 命令 | 用途 |
+|---|---|
+| `lucarned remote start` | 通过 `/api/remote/start` 启动远程接入隧道 |
+| `lucarned remote status` | 通过 `/api/remote/status` 查询隧道状态 |
+| `lucarned remote stop` | 通过 `/api/remote/stop` 停止隧道 |
+| `--control-port PORT` | 指定 loopback control plane 端口，默认 `7801` |
+| `--json` | 输出稳定 JSON，便于脚本消费 |
+| `--provider ID` | 仅 `start`：覆盖 daemon 配置中的 provider |
+| `--field KEY=VALUE` | 仅 `start`：覆盖/补充 provider 字段 |
+
+### Config 面板（远程配置）
+
+| 键位 | 用途 |
+|---|---|
+| `Enter` | 编辑选中字段 / 切换 provider（密钥字段掩码显示，不回显） |
+| 输入字符 / `Backspace` | 编辑进行中的字段值 |
+| `Enter`（编辑中） | 提交编辑 |
+| `Esc`（编辑中） | 取消编辑 |
+| `s` / `S` | 校验并保存回 `lucarned.yaml`（生成带时间戳的备份） |

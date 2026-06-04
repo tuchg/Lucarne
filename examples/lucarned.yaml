@@ -34,6 +34,49 @@ updates:
   remind_interval_hours: 24 # Minimum hours between reminders for the same version.
   repository: tuchg/Lucarne # GitHub repository to check.
 
+remote:
+  # Public-internet exposure of the loopback terminal gateway via a pluggable
+  # tunnel backend. Default-off; this is the highest-severity surface in the
+  # project (live terminal mirror + input). See ADR
+  # docs/decisions/2026-05-30-remote-access-tunnel-adapter.md.
+  enabled: false # Autostart gate. Off → control plane stays ready; tunnel starts lazily via `lucarned remote start`.
+  provider: cloudflared # Tunnel backend id. Only `cloudflared` is implemented this release.
+  gateway_addr: 127.0.0.1:7800 # Gateway bind (the ONLY port the tunnel targets). Forced loopback; the tunnel dials back in.
+  control_addr: 127.0.0.1:7801 # Loopback-only control plane (/api/remote/*). DISTINCT port the tunnel never targets (SEC-002); returns the access token.
+  auth_token: "" # Gateway access token. Blank → auto-generated at startup. If set, must be ≥32 chars / non-whitespace or the daemon refuses to start (SEC-008).
+  readonly_token: "" # Optional read-only access token (SEC-013). Blank → no read-only tier. If set, must be ≥32 chars / non-whitespace; its sessions may mirror terminals but are refused all write frames (input / create / close / agent prompts).
+  insecure: false # NEVER expose without auth. Set true only to deliberately disable auth (prints a loud warning).
+  # Runtime auth hardening (fixed seed values, not configurable here):
+  #   ws auth (incl. web /chat) = token → single-use ticket (~30s TTL) → validated/consumed before upgrade; /api uses Bearer.
+  #   auth failures are rate-limited per real client identity (Cf-Connecting-Ip trusted only from the loopback tunnel);
+  #     the shared loopback key is never hard-locked (SEC-005) — only soft-delayed — so one attacker can't lock out everyone.
+  #   ws connections are capped (global semaphore, 503 on excess) with per-connection session + frame-rate caps (SEC-004),
+  #     and each ws session has an idle + max-lifetime close (SEC-006). Comparisons are constant-time.
+  cloudflare:
+    token: "" # Named-tunnel token. Blank → quick tunnel (zero-config, random trycloudflare.com URL). SEC-012: a quick tunnel is plaintext at the Cloudflare edge (the daemon warns on start) — prefer a named tunnel for sensitive sessions. L3: the token is passed to cloudflared via a 0600 --token-file (kept off the process argv), removed when the tunnel stops.
+    public_url: "" # Stable public URL for a named tunnel (required with `token`; the provider validates this — M7). Blank for quick tunnels.
+    binary_path: "" # Absolute path to the cloudflared binary to pin it (SEC-003). Blank → resolved on $PATH to an absolute path; world-writable dirs / missing binary are refused.
+
+  # H6c: GENERIC per-provider field maps keyed by provider id. The selected
+  # `provider` above picks which block is used; the daemon passes the fields
+  # straight through to the provider without interpreting any field, so adding a
+  # backend (FRP / relay) is just a new providers.<id> block — no daemon change.
+  # The legacy `cloudflare:` block above is still accepted (back-compat) and is
+  # merged UNDER providers.cloudflared (the generic map wins per key); new
+  # configs should prefer `providers:`.
+  providers:
+    cloudflared:
+      token: "" # Named-tunnel token (same as the legacy cloudflare.token); blank → quick tunnel.
+      public_url: "" # Named-tunnel public URL (required-when a token is set — M7).
+      binary_path: "" # Pin the cloudflared binary (SEC-003); blank → resolve on $PATH.
+  #  # Reserved tunnel backends (NOT implemented this release — adapter seams only).
+  #  # Each requires implementing `RemoteAccessProvider` in lucarne-remote and
+  #  # registering it; see ADR 2026-05-30-remote-access-tunnel-adapter.md. Once a
+  #  # backend exists, configure it purely via its providers.<id> field map —
+  #  # NO daemon-config change is needed (H6c).
+  #    frp:   { server_addr: "", token: "" }   # reserved: FRP self-hosted tunnel
+  #    relay: { url: "" }                        # reserved: lightweight self-hosted relay
+
 channels:
   telegram:
     enabled: true # Enable Telegram channel.

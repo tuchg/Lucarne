@@ -1,3 +1,35 @@
+#![allow(
+    clippy::await_holding_lock,
+    clippy::bind_instead_of_map,
+    clippy::clone_on_copy,
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::explicit_auto_deref,
+    clippy::items_after_test_module,
+    clippy::large_enum_variant,
+    clippy::manual_inspect,
+    clippy::manual_div_ceil,
+    clippy::manual_repeat_n,
+    clippy::needless_borrows_for_generic_args,
+    clippy::needless_return,
+    clippy::needless_update,
+    clippy::new_ret_no_self,
+    clippy::new_without_default,
+    clippy::obfuscated_if_else,
+    clippy::redundant_closure,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::unneeded_struct_pattern,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnecessary_filter_map,
+    clippy::unnecessary_map_or,
+    clippy::unnecessary_sort_by,
+    clippy::unnecessary_to_owned,
+    clippy::unwrap_or_default,
+    clippy::useless_conversion,
+    clippy::wrong_self_convention
+)]
+
 //! lucarne — agent multiplexer.
 //!
 //! A protocol-normalizing layer for AI agent CLIs (Claude / Codex /
@@ -42,6 +74,8 @@ pub mod launcher;
 pub mod observability;
 mod provider_id;
 pub mod runtime;
+#[cfg(feature = "terminal-agent-bind")]
+pub mod terminal_agent_bind;
 pub(crate) mod time_display;
 
 pub mod testing;

@@ -1,7 +1,13 @@
 # Homebrew Binary Release Design
 
 Date: 2026-05-19
-Status: approved for implementation planning
+Status: superseded by cargo-dist release packaging
+
+> Current release reality: root `Cargo.toml` delegates packaging to
+> `cargo-dist`; release archives are `.tar.xz`, cover macOS, Linux, and Windows
+> x86_64/aarch64 targets, and package only the single `lucarned` binary. Keep the
+> historical design below as context for the Homebrew transition, but do not use
+> its macOS-only `.tar.gz` workflow as the current release procedure.
 
 ## Problem
 

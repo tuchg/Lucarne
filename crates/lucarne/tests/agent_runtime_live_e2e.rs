@@ -1,3 +1,5 @@
+#![allow(clippy::while_let_loop)]
+
 mod live;
 
 use base64::Engine;

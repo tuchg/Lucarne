@@ -13,6 +13,10 @@ copilot = []
 gemini = []
 pi = []
 memory-profiling = ["agent-sessions/memory-profiling"]
+# Terminal-adjacent agent transcript binding for rmux/web entrypoints. Kept as
+# an opt-in core feature so entry layers can reuse Lucarne's provider and
+# control-plane contracts without carrying a separate sidecar crate.
+terminal-agent-bind = []
 
 [dependencies]
 serde = { workspace = true }

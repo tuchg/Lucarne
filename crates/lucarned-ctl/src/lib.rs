@@ -6,7 +6,9 @@ pub mod process;
 #[cfg(feature = "updates")]
 pub mod updates;
 
-pub use args::{parse, usage, AutostartCommand, Command, ParseError};
+pub use args::{
+    parse, usage, AutostartCommand, Command, ParseError, RemoteCommand, RemoteCommandOptions,
+};
 
 pub fn run(command: Command) -> Result<(), String> {
     match command {
@@ -27,6 +29,8 @@ pub fn run(command: Command) -> Result<(), String> {
         }
         Command::Doctor => doctor::run_doctor(),
         Command::Update => update_requires_async_or_feature(),
+        Command::Tui => Err("tui command is handled by lucarned".to_string()),
+        Command::Remote(_) => Err("remote command is handled by lucarned".to_string()),
         Command::Autostart(command) => run_autostart(command),
     }
 }

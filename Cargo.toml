@@ -4,6 +4,9 @@ default-members = [
     "crates/lucarne",
     "crates/lucarne-adapter",
     "crates/lucarne-channel",
+    "crates/lucarne-rmux",
+    "crates/lucarne-termgw",
+    "crates/lucarne-remote",
     "crates/lucarned-ctl",
     "crates/lucarne-telegram",
     "crates/lucarne-wechat",
@@ -15,6 +18,9 @@ members = [
     "crates/lucarne-adapter",
     "crates/lucarne-channel",
     "crates/lucarne-fakeagent",
+    "crates/lucarne-rmux",
+    "crates/lucarne-termgw",
+    "crates/lucarne-remote",
     "crates/lucarned-ctl",
     "crates/lucarne-telegram",
     "crates/lucarne-wechat",
@@ -56,6 +62,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     # Also let daemon HTTP clients discover OS proxy settings.
     "system-proxy",
 ] }
+# Shared by gateway/daemon crates. Hoisted to keep the version aligned;
+# consumers add their own features (e.g. `ws`) at the crate level.
+axum = { version = "0.8" }
 
 [profile.release]
 opt-level = "z"

@@ -1,12 +1,12 @@
 # lucarned Install Autostart Implementation Plan
 
-> **Status note:** Original plan used a separate `lucarnedctl` binary. Implementation changed after size testing: control commands are now integrated into `lucarned`, backed by a std-only `crates/lucarned-ctl` library crate. This keeps future standalone extraction easy while removing `clap` from `lucarned` and shipping one binary.
+> **Status note:** Original plan used a separate `lucarnedctl` binary. Implementation changed after size testing: control commands are now integrated into `lucarned`, backed by `crates/lucarned-ctl` as a library crate. Current releases ship one binary, `lucarned`; `lucarned-ctl` remains small/std-oriented by default, with update-check dependencies isolated behind its `updates` feature. Treat any unchecked `lucarnedctl` binary steps below as historical plan text, not current implementation instructions.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship cargo-dist installers plus built-in `lucarned` commands that manage user-level autostart and diagnostics on macOS, Windows, and Linux.
 
-**Architecture:** `lucarned` remains the only shipped binary. `crates/lucarned-ctl` is a std-only library crate used by `lucarned` for parser, paths, doctor, and autostart commands. Platform autostart code is cfg-isolated and shells out to LaunchAgent/`launchctl`, Task Scheduler/`schtasks`, or systemd user/`systemctl --user`.
+**Architecture:** `lucarned` remains the only shipped binary. `crates/lucarned-ctl` is a std-oriented library crate used by `lucarned` for parser, paths, doctor, autostart, and update commands. Platform autostart code is cfg-isolated and shells out to LaunchAgent/`launchctl`, Task Scheduler/`schtasks`, or systemd user/`systemctl --user`.
 
 **Tech Stack:** Rust std, Cargo binary targets, cargo-dist shell/PowerShell installers, GitHub Actions, launchctl, schtasks, systemctl.
 

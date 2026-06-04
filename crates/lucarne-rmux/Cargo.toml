@@ -1,0 +1,27 @@
+[package]
+name = "lucarne-rmux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rmux terminal capability: domain types, archive, adapter, and live monitor."
+rust-version.workspace = true
+repository.workspace = true
+
+# The rmux terminal capability package: stable terminal domain/wire types,
+# archive helpers, adapter, and live monitor. This is the only crate that names
+# `rmux_sdk`; preview-API churn stops here.
+
+[dependencies]
+# PINNED rmux preview (=0.3.1) — preview APIs break between patches; bump only
+# deliberately. Validated against the running daemon in spike4-attach-handoff.
+rmux-sdk = "=0.3.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bitflags = "2"
+dirs = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

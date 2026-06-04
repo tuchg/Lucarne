@@ -1,3 +1,14 @@
+#![allow(
+    clippy::chars_last_cmp,
+    clippy::chars_next_cmp,
+    clippy::clone_on_copy,
+    clippy::explicit_auto_deref,
+    clippy::large_enum_variant,
+    clippy::manual_div_ceil,
+    clippy::obfuscated_if_else,
+    clippy::unnecessary_map_or
+)]
+
 //! WeChat notification bridge for lucarne.
 //!
 //! This crate intentionally implements only the WeChat user journey:

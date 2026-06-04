@@ -176,6 +176,64 @@ Telegram needs Topics/thread mode for the entry chat. A private chat with the bo
 Telegram workspaces map to Forum Topics. One project gets one topic; one topic can bind one live agent session.
 - Telegram supports every WeChat feature.
 
+### Terminal monitor and the `lucarned tui` dashboard
+
+The terminal-monitor subsystem is delivered through the `lucarned` product
+bundle feature (`product-terminal`). The default source build remains the base
+daemon; release packaging opts into the bundle so installed users still get the
+single `lucarned` entry. The terminal bundle mirrors sessions on your
+system-wide rmux daemon to a web terminal view and lets a session be popped into
+your local terminal and retracted again while the remote mirror keeps running.
+External Web apps consume the same gateway API; Lucarne does not ship a separate
+internal web-chat runtime crate.
+
+`lucarned tui` is the single interactive entry for the local operator. It is a
+full-screen, arrow-key-navigable dashboard and replaces the old standalone
+`term` CLI. Launch it with:
+
+```bash
+lucarned tui                             # launch the full-screen dashboard
+```
+
+From source, build or run this capability with an explicit feature:
+
+```bash
+cargo +nightly run -Zbuild-dir-new-layout -p lucarned --features product-terminal -- tui
+```
+
+The dashboard has three panels (switch with `Tab` / `←` `→`, navigate items with
+`↑` `↓`, quit with `q` / `Esc`):
+
+- **Sessions** — lists your system-wide rmux sessions; `Enter` attaches (pops the
+  session into your terminal and returns to the dashboard on detach), `d` detaches,
+  `k` / `Del` kills, `a` archives to the shared archive store, `r` refreshes.
+- **Go Public** — `s` starts the remote-access tunnel, `x` stops it, `r` checks
+  status, and `Enter` shows a high-contrast QR modal of the login URL so a phone
+  can reach the terminal gateway remotely (it falls back to the plain URL
+  when the terminal is too small to draw a scannable QR).
+- **Config** — edits the remote-access provider fields (Cloudflared-first) with
+  secret fields masked and never echoed, and saves back to `lucarned.yaml` with a
+  timestamped backup.
+
+For scripts and SSH sessions, use the equivalent headless entry:
+
+```bash
+lucarned remote start
+lucarned remote status --json
+lucarned remote stop
+```
+
+`remote.enabled: true` means autostart the tunnel at daemon boot. With
+`remote.enabled: false`, `lucarned` still serves the loopback control plane and
+waits for `lucarned remote start` or the TUI Go Public panel.
+
+Leaving the Cloudflared token blank uses Cloudflare Quick Tunnel: an ephemeral
+`trycloudflare.com` URL intended for testing/development. Use a named tunnel
+(`token` + `public_url`) for sensitive or repeatable remote access.
+
+See [`docs/tui.md`](docs/tui.md) for the full TUI guide (panels, keybindings,
+the daemon requirement for Go Public, and `term` → `lucarned tui` migration).
+
 ---
 
 ## Architecture Overview
@@ -198,6 +256,27 @@ Telegram workspaces map to Forum Topics. One project gets one topic; one topic c
     ┌──────┬──────┬──────┬──────┐
   Claude  Codex Gemini Copilot  Pi  ← Agent CLI processes
 ```
+
+### Terminal-monitor subsystem
+
+A parallel subsystem that mirrors the user's system-wide rmux terminal sessions
+to web clients through the gateway API — reachable remotely through a tunnel.
+
+```
+   ┌──────────────┐
+   │  web client  │  ← External Web app / browser terminal
+   └──────┬───────┘
+          │
+    lucarne-termgw                     ← Axum ws/HTTP gateway API
+          │
+    lucarne-rmux                       ← Terminal vocabulary + archive + live rmux-sdk binding
+          │
+   ┌──────┴───────┐
+   │ system rmux  │   lucarne-remote     ← go-public tunnel registry (Cloudflared-first)
+   │   daemon     │
+   └──────────────┘   lucarned tui / remote CLI ← sessions / go-public / config
+```
+
 ---
 
 ## Agent Capability Matrix
@@ -221,7 +300,7 @@ Telegram workspaces map to Forum Topics. One project gets one topic; one topic c
 
 ```bash
 git clone https://github.com/tuchg/Lucarne.git
-cd agents
+cd Lucarne
 cargo +nightly check -Zbuild-dir-new-layout
 cargo +nightly test -Zbuild-dir-new-layout
 ```
@@ -232,8 +311,8 @@ cargo +nightly test -Zbuild-dir-new-layout
 - [x] Linux support: installation docs, service management, release packages, and smoke tests
 - [x] Windows support: installation docs, background execution, path / process compatibility, and release packages
 - [ ] Message modes: steer / queue
-- [ ] Split `agent-sessions` into an independent crate
-- [ ] Support remote agent environments
+- [x] Keep `agent-sessions` as an independent workspace crate
+- [x] Support remote agent environments: rmux terminal monitor + gateway API + go-public tunnel
 - [ ] More agent providers: Cursor, opencode, and more
 - [ ] More channels: Discord, Slack, Feishu, DingTalk, Matrix, QQ, and more
 - [ ] ....

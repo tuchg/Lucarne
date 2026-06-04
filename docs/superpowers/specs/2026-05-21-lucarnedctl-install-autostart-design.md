@@ -4,7 +4,12 @@
 
 Provide a first-party install and user-level background startup experience for `lucarned` on macOS, Windows, and Linux without requiring Homebrew, winget, choco, Scoop, or system package managers.
 
-Use `cargo-dist` as the release packager and official installer generator. Keep one installed binary, `lucarned`, with built-in control commands backed by a small std-only helper library crate, `lucarned-ctl`.
+Use `cargo-dist` as the release packager and official installer generator. Keep one installed binary, `lucarned`, with built-in control commands backed by a small std-oriented helper library crate, `lucarned-ctl`.
+
+> Current note: `lucarned-ctl` remains a library crate, not a shipped
+> `lucarnedctl` binary. Its default build stays small and std-oriented, while
+> the intentional `updates` feature adds `reqwest`, `semver`, `serde`,
+> `serde_json`, and `tokio`; `lucarned` enables that feature for update checks.
 
 ## Goals
 
@@ -18,7 +23,8 @@ Use `cargo-dist` as the release packager and official installer generator. Keep 
   - macOS: LaunchAgent.
   - Windows: Task Scheduler logon task.
   - Linux: systemd user service.
-- `lucarned-ctl` stays std-only and small.
+- `lucarned-ctl` stays small and std-oriented in its default build; update
+  checks are isolated behind its `updates` feature.
 - `lucarned` uses the ctl crate for command parsing/diagnostics/autostart but does not import adapter/core logic into that crate.
 - Platform code is compiled only for its target with `#[cfg]`.
 - Agent CLI installation and authentication stay out of scope. Diagnostics may report missing CLIs only.
@@ -30,7 +36,8 @@ Use `cargo-dist` as the release packager and official installer generator. Keep 
 - No Windows system service in the first version.
 - No root-owned launch daemon or systemd system unit in the first version.
 - No agent installation, agent login, token copy, or credential migration.
-- No `clap`, `tokio`, `reqwest`, `serde`, `rusqlite`, `lucarne`, or adapter crates in `lucarned-ctl`.
+- No `clap`, `rusqlite`, `lucarne`, or adapter crates in `lucarned-ctl`; async
+  HTTP/update dependencies are allowed only behind the `updates` feature.
 - No separate `lucarnedctl` release binary in the first version. The separate crate preserves the option to add one later.
 
 ## Release/install architecture
@@ -90,9 +97,13 @@ New library crate:
 - Path: `crates/lucarned-ctl`
 - Package: `lucarned-ctl`
 - Library import: `lucarned_ctl`
-- Source imports: none outside Rust `std`
+- Source imports: Rust `std` by default; optional update modules may import the
+  dependencies gated by the `updates` feature.
 
-`lucarned` depends on `lucarned-ctl` and routes command-line control commands through it. The ctl crate must not depend on `lucarned`, `lucarne`, channel adapters, async runtimes, HTTP clients, or SQLite.
+`lucarned` depends on `lucarned-ctl` and routes command-line control commands
+through it. The ctl crate must not depend on `lucarned`, `lucarne`, channel
+adapters, or SQLite; async runtime and HTTP client dependencies are confined to
+the `updates` feature.
 
 Command parser:
 
@@ -274,7 +285,7 @@ cargo +nightly test -Zbuild-dir-new-layout -p lucarned
 
 ## Expected binary size
 
-Merging ctl command handling into `lucarned` while removing `clap` is expected to be size-neutral or smaller than the prior `lucarned` binary. The ctl crate itself remains std-only and can later grow a standalone binary if needed.
+Merging ctl command handling into `lucarned` while removing `clap` is expected to be size-neutral or smaller than the prior `lucarned` binary. The ctl crate itself remains std-oriented by default and can later grow a standalone binary if needed.
 
 ## Acceptance criteria
 

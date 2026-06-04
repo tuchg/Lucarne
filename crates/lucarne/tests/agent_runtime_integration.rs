@@ -1,3 +1,5 @@
+#![allow(clippy::single_match)]
+
 pub mod common;
 
 use common::agent_runtime::{

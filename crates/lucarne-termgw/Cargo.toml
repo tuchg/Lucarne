@@ -1,0 +1,39 @@
+[package]
+name = "lucarne-termgw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Axum WebSocket/HTTP gateway over the rmux terminal monitor."
+rust-version.workspace = true
+repository.workspace = true
+
+# Terminal gateway: an axum WebSocket + HTTP surface over the rmux terminal
+# monitor. Consumes the monitor's grid fan-out, applies a per-client differ, and
+# serves an interactive web terminal view + a small control API for the CLI.
+
+[dependencies]
+lucarne = { path = "../lucarne", features = ["terminal-agent-bind"] }
+lucarne-rmux = { path = "../lucarne-rmux" }
+async-trait = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+dirs = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+# Public-exposure auth layer (TASK-003): CSPRNG token + single-use ws ticket +
+# constant-time compare. Pinned directly here (not in root workspace deps) — the
+# root Cargo.toml is owned by another task this wave.
+rand = "0.8"
+subtle = "2"
+
+[dev-dependencies]
+# HTTP router integration tests (SEC-001 ws ticket gate, SEC-002 control-plane
+# separation): drive routers via `tower::ServiceExt::oneshot` without binding a
+# socket or standing up a live monitor / agent runtime.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = { workspace = true }
+tokio-tungstenite = "0.29"

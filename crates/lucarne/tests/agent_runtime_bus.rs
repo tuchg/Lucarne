@@ -1,3 +1,5 @@
+#![allow(clippy::useless_conversion)]
+
 use async_trait::async_trait;
 use lucarne::agent_runtime::{
     AgentError, AgentErrorKind, AgentInput, AgentRuntime, AgentSession, AgentSessionFacade,

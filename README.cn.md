@@ -176,6 +176,54 @@ Telegram 入口 chat 需要开启 Topics/Thread mode。可以直接使用 Bot �
 Telegram workspace 映射为 Forum Topic。一个项目一个 topic；一个 topic 可绑定一个 live Agent session。
 - Telegram支持WeChat所有功能
 
+### 终端监控与 `lucarned tui` 控制台
+
+终端监控子系统通过 `lucarned` 的产品 bundle feature（`product-terminal`）交付。
+默认源码构建仍保持 base daemon；release packaging 会显式启用 bundle，所以安装用户仍然
+只有一个 `lucarned` 入口。终端 bundle 会把系统级 rmux daemon 上的会话镜像到 web
+终端视图，并允许把某个会话弹出到本地终端、再收回，而远程镜像保持运行。外部 Web app
+直接消费同一套 gateway API；Lucarne 内部不再维护独立 web-chat runtime crate。
+
+`lucarned tui` 是本地操作者的唯一交互入口：一个全屏、方向键导航的控制台，替代了
+旧的独立 `term` CLI。启动：
+
+```bash
+lucarned tui                             # 启动全屏控制台
+```
+
+源码构建/运行这个能力时需要显式 feature：
+
+```bash
+cargo +nightly run -Zbuild-dir-new-layout -p lucarned --features product-terminal -- tui
+```
+
+控制台有三个面板（`Tab` / `←` `→` 切换面板，`↑` `↓` 移动选项，`q` / `Esc` 退出）：
+
+- **Sessions（会话）** — 列出系统级 rmux 会话；`Enter` attach（把会话弹出到本地终端，
+  detach 后回到控制台），`d` detach，`k` / `Del` kill，`a` archive 到共享 archive
+  store，`r` 刷新。
+- **Go Public（对外暴露）** — `s` 启动远程接入隧道，`x` 停止，`r` 查询状态，`Enter`
+  弹出登录 URL 的高对比二维码模态，让手机能远程访问终端 gateway（终端太小无法画出
+  可扫码二维码时回退为纯 URL）。
+- **Config（配置）** — 编辑远程接入 provider 字段（Cloudflared 优先），密钥字段掩码
+  显示且永不回显，保存时写回 `lucarned.yaml` 并生成带时间戳的备份。
+
+脚本和 SSH 场景使用等价的 headless 入口：
+
+```bash
+lucarned remote start
+lucarned remote status --json
+lucarned remote stop
+```
+
+`remote.enabled: true` 表示 daemon 启动时自动拉起隧道；`remote.enabled: false`
+时，`lucarned` 仍会提供 loopback control plane，等待 `lucarned remote start` 或 TUI
+Go Public 面板启动隧道。
+
+Cloudflared token 留空时使用 Cloudflare Quick Tunnel：它会生成临时
+`trycloudflare.com` URL，仅适合测试/开发。敏感或需要稳定访问的场景应配置 named
+tunnel（`token` + `public_url`）。
+
 ---
 
 ## 架构概览
@@ -198,6 +246,27 @@ Telegram workspace 映射为 Forum Topic。一个项目一个 topic；一个 top
     ┌──────┬──────┬──────┬──────┐
   Claude  Codex Gemini Copilot  Pi  ← Agent CLI 进程
 ```
+
+### 终端监控子系统
+
+一个并行子系统：把用户系统级 rmux 终端会话通过 gateway API 镜像到 web 客户端，
+并可通过隧道远程访问。
+
+```
+   ┌──────────────┐
+   │  web client  │  ← 外部 Web app / 浏览器终端
+   └──────┬───────┘
+          │
+    lucarne-termgw                    ← Axum ws/HTTP gateway API
+          │
+    lucarne-rmux                      ← 终端词汇 + 归档 + 实时 rmux-sdk 绑定
+          │
+   ┌──────┴───────┐
+   │ 系统 rmux    │   lucarne-remote     ← go-public 隧道注册表（Cloudflared 优先）
+   │   daemon     │
+   └──────────────┘   lucarned tui / remote CLI ← sessions / go-public / config
+```
+
 ---
 
 ## Agent 能力矩阵
@@ -221,7 +290,7 @@ Telegram workspace 映射为 Forum Topic。一个项目一个 topic；一个 top
 
 ```bash
 git clone https://github.com/tuchg/Lucarne.git
-cd agents
+cd Lucarne
 cargo +nightly check -Zbuild-dir-new-layout
 cargo +nightly test -Zbuild-dir-new-layout
 ```
@@ -232,8 +301,8 @@ cargo +nightly test -Zbuild-dir-new-layout
 - [x] Linux 支持：补齐安装说明、服务管理、发布包与 smoke test
 - [x] Windows 支持：补齐安装说明、后台运行、路径 / 进程兼容与发布包
 - [ ] 消息模式 steer/queue
-- [ ] agent-sessions 整理为独立crate
-- [ ] 支持远程 agent 环境
+- [x] `agent-sessions` 保持为独立 workspace crate
+- [x] 支持远程 agent 环境：rmux 终端监控 + gateway API + go-public 隧道
 - [ ] 更多 Agent Provider：Cursor、opencode 等
 - [ ] More channels：Discord、Slack、飞书、钉钉、Matrix、QQ 等更多入口
 - [ ] ....

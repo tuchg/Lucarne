@@ -1,3 +1,10 @@
+#![allow(
+    clippy::await_holding_lock,
+    clippy::manual_contains,
+    clippy::ptr_arg,
+    clippy::too_many_arguments
+)]
+
 use std::{
     collections::HashMap,
     ffi::OsString,

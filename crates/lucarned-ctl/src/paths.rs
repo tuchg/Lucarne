@@ -144,22 +144,22 @@ fn autostart_location(_config_dir: &Path) -> Result<(&'static str, PathBuf), Str
     #[cfg(target_os = "macos")]
     {
         let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
-        return Ok((
+        Ok((
             "launchagent",
             PathBuf::from(home).join("Library/LaunchAgents/com.tuchg.lucarned.plist"),
-        ));
+        ))
     }
     #[cfg(windows)]
     {
-        return Ok(("scheduled-task", PathBuf::from("LucarneLucarned")));
+        Ok(("scheduled-task", PathBuf::from("LucarneLucarned")))
     }
     #[cfg(target_os = "linux")]
     {
         let home = env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
-        return Ok((
+        Ok((
             "systemd-user",
             PathBuf::from(home).join(".config/systemd/user/lucarned.service"),
-        ));
+        ))
     }
     #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {

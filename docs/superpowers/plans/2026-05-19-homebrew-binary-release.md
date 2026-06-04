@@ -1,5 +1,12 @@
 # Homebrew Binary Release Implementation Plan
 
+> **Status note:** Superseded by the current cargo-dist release pipeline in
+> root `Cargo.toml`. Current releases package only `lucarned`, target macOS,
+> Linux, and Windows x86_64/aarch64, emit `.tar.xz` archives, and should be
+> created by the release workflow from an annotated tag rather than manual
+> `gh release create` commands. The original task plan below is retained as
+> historical implementation context only.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `brew install lucarned` download macOS Apple Silicon and Intel release binaries instead of rebuilding Rust locally.

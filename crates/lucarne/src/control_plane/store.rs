@@ -124,7 +124,7 @@ impl ControlPlaneSqliteStore {
         Ok(count > 0)
     }
 
-    fn entity_by_id<T: DeserializeOwned>(
+    pub fn entity_state<T: DeserializeOwned>(
         &self,
         kind: &str,
         entity_id: &str,
@@ -144,7 +144,7 @@ impl ControlPlaneSqliteStore {
             .transpose()
     }
 
-    fn entities_by_kind<T: DeserializeOwned>(
+    pub fn entities_by_kind<T: DeserializeOwned>(
         &self,
         kind: &str,
     ) -> Result<Vec<T>, ControlPlaneStoreError> {
@@ -229,14 +229,14 @@ impl ControlPlaneSqliteStore {
         &self,
         provider_session_id: &ProviderSessionId,
     ) -> Result<Option<ProviderSessionRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("provider_session", provider_session_id.as_str())
+        self.entity_state("provider_session", provider_session_id.as_str())
     }
 
     pub fn workspace(
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<WorkspaceBinding>, ControlPlaneStoreError> {
-        self.entity_by_id("workspace", workspace_id.as_str())
+        self.entity_state("workspace", workspace_id.as_str())
     }
 
     pub fn workspace_bindings(&self) -> Result<Vec<WorkspaceBinding>, ControlPlaneStoreError> {
@@ -265,7 +265,7 @@ impl ControlPlaneSqliteStore {
         &self,
         live_instance_id: &LiveInstanceId,
     ) -> Result<Option<LiveInstanceRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("live_instance", live_instance_id.as_str())
+        self.entity_state("live_instance", live_instance_id.as_str())
     }
 
     pub fn live_instances_for_restart_cleanup(
@@ -290,7 +290,7 @@ impl ControlPlaneSqliteStore {
     }
 
     pub fn turn(&self, turn_id: &TurnId) -> Result<Option<TurnRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("turn", turn_id.as_str())
+        self.entity_state("turn", turn_id.as_str())
     }
 
     pub fn turns_for_workspace(
@@ -304,7 +304,7 @@ impl ControlPlaneSqliteStore {
         &self,
         command_id: &CommandId,
     ) -> Result<Option<CommandWorkflow>, ControlPlaneStoreError> {
-        self.entity_by_id("command", command_id.as_str())
+        self.entity_state("command", command_id.as_str())
     }
 
     pub fn command_workflows_for_workspace(
@@ -318,14 +318,14 @@ impl ControlPlaneSqliteStore {
         &self,
         token: &CommandCallbackToken,
     ) -> Result<Option<CommandCallbackRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("command_callback", token.as_str())
+        self.entity_state("command_callback", token.as_str())
     }
 
     pub fn intervention_callback(
         &self,
         token: &InterventionCallbackToken,
     ) -> Result<Option<InterventionCallbackRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("intervention_callback", token.as_str())
+        self.entity_state("intervention_callback", token.as_str())
     }
 
     pub fn delete_intervention_callbacks_for_live_instances(
@@ -401,21 +401,21 @@ impl ControlPlaneSqliteStore {
         &self,
         workspace_id: &WorkspaceId,
     ) -> Result<Option<HistoryReplayRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("history_replay", workspace_id.as_str())
+        self.entity_state("history_replay", workspace_id.as_str())
     }
 
     pub fn history_older_callback(
         &self,
         token: &HistoryOlderCallbackToken,
     ) -> Result<Option<HistoryOlderCallbackRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("history_older_callback", token.as_str())
+        self.entity_state("history_older_callback", token.as_str())
     }
 
     pub fn channel_binding(
         &self,
         binding_id: &ChannelBindingId,
     ) -> Result<Option<ChannelBinding>, ControlPlaneStoreError> {
-        self.entity_by_id("channel_binding", binding_id.as_str())
+        self.entity_state("channel_binding", binding_id.as_str())
     }
 
     pub fn channel_bindings_for_workspace(
@@ -448,7 +448,7 @@ impl ControlPlaneSqliteStore {
         &self,
         panel_id: &PanelRenderId,
     ) -> Result<Option<PanelRenderRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("panel_render", panel_id.as_str())
+        self.entity_state("panel_render", panel_id.as_str())
     }
 
     pub fn panel_renders(&self) -> Result<Vec<PanelRenderRecord>, ControlPlaneStoreError> {
@@ -467,7 +467,7 @@ impl ControlPlaneSqliteStore {
         &self,
         task_id: &ScheduledTaskId,
     ) -> Result<Option<ScheduledTaskRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("scheduled_task", task_id.as_str())
+        self.entity_state("scheduled_task", task_id.as_str())
     }
 
     pub fn due_scheduled_tasks(
@@ -515,14 +515,14 @@ impl ControlPlaneSqliteStore {
         &self,
         link_id: &SubAgentLinkId,
     ) -> Result<Option<SubAgentLinkRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("subagent_link", link_id.as_str())
+        self.entity_state("subagent_link", link_id.as_str())
     }
 
     pub fn subagent_callback(
         &self,
         token: &SubAgentCallbackToken,
     ) -> Result<Option<SubAgentCallbackRecord>, ControlPlaneStoreError> {
-        self.entity_by_id("subagent_callback", token.as_str())
+        self.entity_state("subagent_callback", token.as_str())
     }
 
     pub fn workspace_for_provider_session(

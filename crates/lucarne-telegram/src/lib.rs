@@ -1,3 +1,14 @@
+#![allow(
+    clippy::await_holding_lock,
+    clippy::explicit_auto_deref,
+    clippy::large_enum_variant,
+    clippy::manual_contains,
+    clippy::manual_inspect,
+    clippy::needless_borrow,
+    clippy::too_many_arguments,
+    clippy::unnecessary_map_or
+)]
+
 //! Telegram channel + bot built on top of `lucarne` and `agent-sessions`.
 //!
 //! Layering:
