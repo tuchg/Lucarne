@@ -77,7 +77,7 @@ impl Claude {
                 break;
             }
 
-            let raw: RawEntry<'_> = serde_json::from_slice(&line)?;
+            let raw: RawEntry<'_> = parse_claude_json_slice(&line)?;
 
             if session_id.is_none() && raw.session_id.is_some() {
                 session_id = opt_box_str(raw.session_id);
@@ -236,7 +236,7 @@ fn parse_user_content_text(raw: &RawValue) -> Option<String> {
     if first != b'[' {
         return None;
     }
-    let blocks: Vec<TitleProbeBlock<'_>> = serde_json::from_str(raw.get()).ok()?;
+    let blocks: Vec<TitleProbeBlock<'_>> = parse_claude_json_str(raw.get()).ok()?;
     blocks.into_iter().find_map(|block| match block.kind {
         Some("text") => block.text.map(|cow| cow.into_owned()),
         _ => None,
@@ -292,7 +292,7 @@ where
     let mut line = Vec::new();
 
     while read_next_nonempty_line(&mut reader, &mut line)? {
-        let raw: RawEntry<'_> = serde_json::from_slice(&line)?;
+        let raw: RawEntry<'_> = parse_claude_json_slice(&line)?;
 
         match raw.kind {
             Some("user") | Some("assistant") => {
@@ -591,7 +591,7 @@ where
     let mut timestamp: Option<SmolStr> = None;
 
     while read_next_nonempty_line(&mut reader, &mut line)? {
-        let raw: RawEntry<'_> = match serde_json::from_slice(&line) {
+        let raw: RawEntry<'_> = match parse_claude_json_slice(&line) {
             Ok(raw) => raw,
             Err(_err) if session_id.is_some() || cwd.is_some() => {
                 return Ok(parsed_claude_meta(version, session_id, cwd, timestamp));
@@ -722,6 +722,250 @@ fn map_claude_blocks(blocks: Vec<ClaudeBlock<'_>>) -> Vec<ContentBlock> {
             }),
         })
         .collect()
+}
+
+/// `serde_json::from_slice` that tolerates duplicate object keys (see
+/// `DupTolerant`).
+fn parse_claude_json_slice<'de, T>(line: &'de [u8]) -> serde_json::Result<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    let mut deserializer = serde_json::Deserializer::from_slice(line);
+    T::deserialize(DupTolerant::new(&mut deserializer))
+}
+
+/// `serde_json::from_str` that tolerates duplicate object keys.
+fn parse_claude_json_str<'de, T>(json: &'de str) -> serde_json::Result<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    T::deserialize(DupTolerant::new(&mut deserializer))
+}
+
+/// serde Deserializer wrapper that tolerates duplicate object keys
+/// (last-wins, like `serde_json::Value`).
+///
+/// Claude Code emits both snake_case and camelCase spellings of the same
+/// field in one JSON object (e.g. `session_id` and `sessionId`), and
+/// serde's generated struct visitors reject the second occurrence. This
+/// wrapper buffers each object as borrowed (key, raw value) pairs, drops
+/// repeated keys (comparing camelCase and snake_case spellings as
+/// equivalent), and replays the deduplicated object into the visitor, so
+/// zero-copy borrows into the input line are preserved.
+struct DupTolerant<D> {
+    inner: D,
+}
+
+impl<D> DupTolerant<D> {
+    fn new(inner: D) -> Self {
+        DupTolerant { inner }
+    }
+}
+
+/// Normalize `key` to the field name it belongs to: keys already in
+/// `fields` pass through; camelCase spellings are converted to snake_case
+/// and used when that matches a field; everything else passes through
+/// untouched (unknown keys are ignored by serde's generated visitors).
+fn canonical_field<'de>(key: &'de str, fields: &'static [&'static str]) -> Cow<'de, str> {
+    // serde_derive lists both the canonical name and every alias in
+    // `fields`, so normalizing camelCase spellings to snake_case folds
+    // both spellings of a field onto one key. Keys that don't match any
+    // field pass through untouched (unknown keys are ignored by serde's
+    // generated visitors).
+    let snake = to_snake_case(key);
+    if fields.contains(&snake.as_str()) {
+        if snake == key {
+            Cow::Borrowed(key)
+        } else {
+            Cow::Owned(snake)
+        }
+    } else {
+        Cow::Borrowed(key)
+    }
+}
+
+/// `camelCase`/`PascalCase` to `snake_case` (uppercase runs like `ID`
+/// count as one word).
+fn to_snake_case(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    let mut out = String::with_capacity(key.len() + 4);
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_ascii_uppercase() {
+            out.push(c);
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        let next = chars.get(i + 1).copied();
+        let boundary = match prev {
+            Some(p) if p.is_ascii_lowercase() => true,
+            Some(p) if p.is_ascii_uppercase() => next.is_some_and(|n| n.is_ascii_lowercase()),
+            _ => false,
+        };
+        if boundary && !out.is_empty() {
+            out.push('_');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+impl<'de, D> serde::Deserializer<'de> for DupTolerant<D>
+where
+    D: serde::Deserializer<'de>,
+{
+    type Error = D::Error;
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf unit unit_struct seq tuple tuple_struct map
+        enum identifier ignored_any
+    }
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.inner.deserialize_any(visitor)
+    }
+
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        // Must not go through `deserialize_any`: `Option`'s visitor only
+        // handles `visit_none`/`visit_some`, which serde_json dispatches
+        // from its own `deserialize_option`.
+        self.inner.deserialize_option(visitor)
+    }
+
+    fn deserialize_newtype_struct<V>(
+        self,
+        name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        // `&RawValue`'s Deserialize enters through the serde_json `TOKEN`
+        // newtype; forward untouched so raw slices still capture zero-copy.
+        self.inner.deserialize_newtype_struct(name, visitor)
+    }
+
+    fn deserialize_struct<V>(
+        self,
+        name: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        struct DedupVisitor<V> {
+            inner: V,
+            fields: &'static [&'static str],
+        }
+
+        impl<'de, V: serde::de::Visitor<'de>> serde::de::Visitor<'de> for DedupVisitor<V> {
+            type Value = V::Value;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.inner.expecting(formatter)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut pairs: Vec<(&'de str, &'de RawValue)> = Vec::with_capacity(16);
+                let mut seen: Vec<Cow<'de, str>> = Vec::with_capacity(16);
+                while let Some(key) = map.next_key::<&'de str>()? {
+                    let value: &'de RawValue = map.next_value()?;
+                    // Keys without uppercase letters are already canonical
+                    // (or unknown); skip the snake_case conversion entirely.
+                    let canonical = if key.bytes().any(|b| b.is_ascii_uppercase()) {
+                        canonical_field(key, self.fields)
+                    } else {
+                        Cow::Borrowed(key)
+                    };
+                    match seen.iter().position(|seen| *seen == canonical) {
+                        Some(pos) => {
+                            // Both keys map to the same field. When both
+                            // spellings are listed names, the last occurrence
+                            // wins (like `serde_json::Value`); when only one
+                            // is a listed name, keep that one so serde
+                            // actually resolves the field.
+                            let first = pairs[pos].0;
+                            if self.fields.contains(&key) {
+                                if self.fields.contains(&first) {
+                                    pairs[pos].1 = value;
+                                } else {
+                                    pairs[pos] = (key, value);
+                                }
+                            }
+                        }
+                        None => {
+                            seen.push(canonical);
+                            pairs.push((key, value));
+                        }
+                    }
+                }
+                // ReplayAccess parses with serde_json, whose errors carry
+                // the line/column; keep them via `custom` for foreign
+                // error types.
+                self.inner
+                    .visit_map(ReplayAccess::new(pairs))
+                    .map_err(|error| serde::de::Error::custom(error.to_string()))
+            }
+        }
+
+        self.inner
+            .deserialize_struct(name, fields, DedupVisitor { inner: visitor, fields })
+    }
+}
+
+/// MapAccess that replays buffered (key, raw value) pairs; values are
+/// re-parsed through `DupTolerant`, so duplicate keys are also tolerated
+/// at any nesting depth.
+struct ReplayAccess<'de> {
+    pairs: std::vec::IntoIter<(&'de str, &'de RawValue)>,
+    pending: Option<&'de RawValue>,
+}
+
+impl<'de> ReplayAccess<'de> {
+    fn new(pairs: Vec<(&'de str, &'de RawValue)>) -> Self {
+        ReplayAccess {
+            pairs: pairs.into_iter(),
+            pending: None,
+        }
+    }
+}
+
+impl<'de> serde::de::MapAccess<'de> for ReplayAccess<'de> {
+    type Error = serde_json::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: serde::de::DeserializeSeed<'de>,
+    {
+        let Some((key, value)) = self.pairs.next() else {
+            return Ok(None);
+        };
+        self.pending = Some(value);
+        seed.deserialize(serde::de::value::BorrowedStrDeserializer::new(key))
+            .map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::DeserializeSeed<'de>,
+    {
+        let value = self
+            .pending
+            .take()
+            .expect("next_value_seed without next_key_seed");
+        seed.deserialize(DupTolerant::new(value))
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -868,7 +1112,7 @@ fn parse_claude_message(message: &ClaudeMessage<'_>) -> Result<Vec<ContentBlock>
             })])
         }
         Some(b'[') => {
-            let blocks: Vec<ClaudeBlock<'_>> = serde_json::from_str(raw_content.get())?;
+            let blocks: Vec<ClaudeBlock<'_>> = parse_claude_json_str(raw_content.get())?;
             Ok(map_claude_blocks(blocks))
         }
         _ => Ok(Vec::new()),
@@ -876,7 +1120,7 @@ fn parse_claude_message(message: &ClaudeMessage<'_>) -> Result<Vec<ContentBlock>
 }
 
 fn parse_claude_usage(raw: &RawValue) -> Result<Usage> {
-    let usage: ClaudeUsage<'_> = serde_json::from_str(raw.get())?;
+    let usage: ClaudeUsage<'_> = parse_claude_json_str(raw.get())?;
     Ok(Usage {
         input_tokens: usage.input_tokens.unwrap_or(0),
         output_tokens: usage.output_tokens.unwrap_or(0),
@@ -1446,5 +1690,70 @@ mod tests {
 
         assert_eq!(meta.cwd.as_deref(), Some("/tmp/proj"));
         assert!(title.is_none());
+    }
+
+    #[test]
+    fn parse_claude_json_str_tolerates_duplicate_keys_last_wins() {
+        // Claude Code v2.x emits both snake_case and camelCase spellings of
+        // the same field on one line; serde's struct visitors reject the
+        // second occurrence (the duplicate field `session_id` failure).
+        let raw: super::RawEntry<'_> = super::parse_claude_json_str(
+            r#"{"type":"assistant","session_id":"sess-a","sessionId":"sess-a","message_id":"m1","messageId":"m2"}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.session_id, Some("sess-a"));
+        // Last key wins, like `serde_json::Value`.
+        assert_eq!(raw.message_id, Some("m2"));
+    }
+
+    #[cfg(feature = "agent_session")]
+    #[test]
+    fn probe_session_meta_accepts_dual_key_lines() {
+        use std::io::Cursor;
+
+        // Every assistant/user line in Claude Code v2.1.206+ carries both
+        // `session_id` and `sessionId`; the probe must not fail on them.
+        let bytes = concat!(
+            "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"2026-05-01T11:09:46.280Z\",\"sessionId\":\"sess-dual\"}\n",
+            "{\"type\":\"user\",\"session_id\":\"sess-dual\",\"sessionId\":\"sess-dual\",\"cwd\":\"/work/dual\",\"timestamp\":\"2026-05-01T11:09:46.305Z\",\"isMeta\":false,\"is_meta\":false}\n",
+        );
+
+        let meta = super::Claude::probe_session_meta(Cursor::new(bytes.as_bytes()))
+            .unwrap()
+            .expect("expected session meta");
+
+        assert_eq!(meta.session_id.as_deref(), Some("sess-dual"));
+        assert_eq!(meta.cwd.as_deref(), Some("/work/dual"));
+    }
+
+    #[cfg(feature = "agent_session")]
+    #[test]
+    fn reader_accepts_dual_key_lines_and_nested_progress() {
+        // The watch/history path: an assistant line with dual keys, plus a
+        // progress payload carrying both camelCase and snake_case spellings
+        // (`fullOutput`/`full_output` on a `rename_all = "camelCase"`
+        // struct previously failed as a duplicate field too).
+        let bytes = concat!(
+            r#"{"type":"assistant","session_id":"sess-2","sessionId":"sess-2","cwd":"/work/2","timestamp":"2026-05-01T11:09:46.305Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
+            "\n",
+            r#"{"type":"progress","session_id":"sess-2","sessionId":"sess-2","cwd":"/work/2","timestamp":"2026-05-01T11:09:47.000Z","data":{"type":"hook_progress","hook_event":"PreToolUse","hookEvent":"PreToolUse","command":"run tests","fullOutput":"out","full_output":"out"}}"#,
+            "\n",
+        );
+
+        let (_version, body) = super::parse_claude_reader(
+            Cursor::new(bytes.as_bytes()),
+            crate::ParseSelection::full(),
+        )
+        .unwrap();
+
+        assert_eq!(body.entries.len(), 2);
+        let [super::Entry::Message(_), super::Entry::Progress(super::ProgressEntry::HookProgress {
+            command,
+            ..
+        })] = body.entries.as_ref()
+        else {
+            panic!("expected message + hook progress entries");
+        };
+        assert_eq!(command.as_deref(), Some("run tests"));
     }
 }
