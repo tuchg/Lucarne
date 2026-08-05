@@ -1739,11 +1739,12 @@ impl Bot {
         }
         let mut live = session.live.clone().expect("bound above");
         let final_footer = include_agent_footer.then(|| {
-            let session_ref = self
-                .state
-                .active_provider_session_ref(&session.workspace)
-                .ok()
-                .or_else(|| session.resume_ref.clone())
+            // Use project directory basename instead of UUID session ref
+            let session_label = session
+                .project_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "-".to_string());
             let cwd = session
                 .project_path
@@ -1752,7 +1753,7 @@ impl Bot {
                 .unwrap_or_else(|| "-".to_string());
             AgentMessageFooter {
                 cost: None,
-                session: Some(session_ref),
+                session: Some(session_label),
                 cwd: Some(cwd),
             }
         });
@@ -5107,7 +5108,14 @@ fn render_agent_notification(
     session_ref: Option<&str>,
     text: &str,
 ) -> OutgoingMessage {
-    let session_ref = session_ref.unwrap_or("-");
+    // Use project directory basename (e.g. "tank-battle") instead of UUID session ref
+    let session_label = session
+        .project_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string())
+        .or_else(|| session_ref.map(|s| s.to_string()))
+        .unwrap_or_else(|| "-".to_string());
     let cwd = session
         .project_path
         .as_ref()
@@ -5118,7 +5126,7 @@ fn render_agent_notification(
         text.as_ref(),
         &AgentMessageFooter {
             cost: None,
-            session: Some(session_ref.to_string()),
+            session: Some(session_label),
             cwd: Some(cwd),
         },
     );

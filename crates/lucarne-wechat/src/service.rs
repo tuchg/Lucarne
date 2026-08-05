@@ -2833,7 +2833,13 @@ fn render_agent_message(
     if let Some(cost) = cost.as_deref().or(extracted_cost) {
         footer_lines.push(format!("耗时：{cost}"));
     }
-    footer_lines.push(format!("会话：{session_ref}"));
+    // Use project directory basename (e.g. "tank-battle") instead of UUID
+    let workspace_name = workspace
+        .project_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| session_ref.to_string());
+    footer_lines.push(format!("项目：{workspace_name}"));
     footer_lines.push(format!(
         "目录：{}",
         compact_path(&workspace.project_path.display().to_string(), 58)
@@ -3614,11 +3620,16 @@ fn render_wechat_new_usage() -> &'static str {
 
 fn render_wechat_new_session(
     provider_id: &str,
-    session_ref: &str,
+    _session_ref: &str,
     workspace: &WorkspaceBinding,
 ) -> String {
+    let workspace_name = workspace
+        .project_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| _session_ref.to_string());
     format!(
-        "🆕 新的 {provider_id} 会话\n目录：`{}`\n会话：`{session_ref}`\n\n回复此消息即可开始。",
+        "🆕 新的 {provider_id} 会话\n目录：`{}`\n项目：{workspace_name}\n\n回复此消息即可开始。",
         workspace.project_path.display()
     )
 }
